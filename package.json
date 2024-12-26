@@ -1,0 +1,96 @@
+{
+  "name": "electron-hiprint",
+  "version": "1.0.9",
+  "description": "vue-plugin-hiprint client",
+  "main": "main.js",
+  "author": "254856090@qq.com",
+  "license": "MIT",
+  "homepage": "https://github.com/RainPacker",
+  "scripts": {
+    "start": "electron .",
+    "build-w": "electron-builder -w nsis:ia32 && node ./tools/rename --tag win_x32",
+    "build-w-64": "electron-builder -w nsis:x64 && node ./tools/rename --tag win_x64",
+    "build-m": "electron-builder -m && node ./tools/rename --tag mac_x64",
+    "build-m-arm64": "electron-builder -m --arm64 && node ./tools/rename --tag mac_arm64",
+    "build-l": "electron-builder -l tar.xz && node ./tools/rename --tag linux_64",
+    "build-l-arm64": "electron-builder -l --arm64 && node ./tools/rename --tag linux_arm64",
+    "compress": "node ./tools/code_compress --compress",
+    "restore": "node ./tools/code_compress --restore",
+    "build-all": "npm run build-w && npm run build-w-64 && npm run build-m && npm run build-m-arm64 && npm run build-l && npm run build-l-arm64",
+    "releases": "npm run compress && npm run build-all && npm run restore"
+  },
+  "build": {
+    "productName": "hiprint",
+    "appId": "com.simple.cc.hiprint",
+    "copyright": "yangyang.zhang<yangyang.zhang@weifu.com.cn>",
+    "directories": {
+      "output": "out"
+    },
+    "asar": true,
+    "files": [
+      "**/*"
+    ],
+    "electronDownload": {
+      "mirror": "https://npmmirror.com/mirrors/electron/"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "./build/icons/icon.ico",
+      "uninstallerIcon": "./build/icons/icon.ico",
+      "installerHeaderIcon": "./build/icons/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Hiprint",
+      "include": "installer.nsh"
+    },
+    "mac": {
+      "icon": "./build/icons/icon.icns",
+      "artifactName": "${productName}-${version}.${ext}",
+      "target": [
+        "dmg"
+      ]
+    },
+    "win": {
+      "icon": "./build/icons/256x256.png",
+      "artifactName": "${productName}-${version}.${ext}",
+      "target": [
+        {
+          "target": "nsis"
+        }
+      ]
+    },
+    "linux": {
+      "icon": "./build/icons/256x256.png",
+      "artifactName": "${productName}-${version}.${ext}",
+      "target": [
+        "tar.xz"
+      ]
+    },
+    "protocols": [
+      {
+        "name": "hiprint",
+        "schemes": [
+          "hiprint"
+        ]
+      }
+    ]
+  },
+  "dependencies": {
+    "address": "^1.2.0",
+    "concurrent-tasks": "^1.0.7",
+    "ipp": "^2.0.1",
+    "jquery": "^3.6.0",
+    "node-machine-id": "^1.1.12",
+    "socket.io": "^3.1.0",
+    "socket.io-client": "^3.1.0"
+  },
+  "devDependencies": {
+    "electron": "^13.6.9",
+    "electron-builder": "23.0.6",
+    "fs-extra": "^9.1.0",
+    "prettier": "^1.16.4",
+    "uglify-js": "^3.14.3"
+  }
+}

@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src * 'self' 'unsafe-inline' 'unsafe-eval' data: gap: content: https://ssl.gstatic.com; 
+    media-src * blob: 'self' http://* 'unsafe-inline' 'unsafe-eval'; 
+    style-src * 'self' 'unsafe-inline'; 
+    img-src * 'self' data: content:; 
+    connect-src * blob:;">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Document</title>
+    <link crossorigin href="print-lock.css" rel="stylesheet" />
+     <link crossorigin href="css/hiprint.css"  rel="stylesheet" />
+    <link href="print-lock.css" media="print" rel="stylesheet" />
+    <link href="css/hiprint.css" media="print" rel="stylesheet" />
+    <script>
+      window.$ = window.jQuery = require("jquery");
+      $.fn.onImgLoaded = (callback) => {
+        let cb = (len) => {
+          if (len <= 0) {
+            callback();
+          }
+        };
+        let len = $("img").length;
+        cb(len);
+        let getUrl = (str) => {
+          let reg = /(https?|http|ftp|file):\/\/[-A-Za-z0-9+&@#/%?=~_|!:,.;]+[-A-Za-z0-9+&@#/%=~_|]/g;
+          let v = str.match(reg);
+          if (v && v.length) {
+            return v[0];
+          }
+          return "";
+        };
+        $("img").each((i, e) => {
+          let $img = $(e);
+          let img = new Image();
+          let src = $img.attr("src");
+          if (!new RegExp("[a-zA-Z]+://[^\s]*").test(src)) {
+            src = getUrl($img.attr("style") || "");
+          }
+          img.src = src;
+          if (img.complete || src == "") {
+            len--;
+            cb(len);
+          } else {
+            img.onload = () => {
+              len--;
+              cb(len);
+            };
+            img.onerror = () => {
+              len--;
+              cb(len);
+            };
+          }
+        });
+      };
+    </script>
+  </head>
+
+  <body>
+    <div id="printElement"></div>
+    <script>
+      const { ipcRenderer, BrowserWindow } = require("electron");
+
+      $(document).ready(function() {
+        ipcRenderer.on("print-new", (event, data) => {
+          // alert(JSON.stringify(data))
+          console.log("print-new", data);
+          document.title = data.title ? data.title : "hiprint打印";
+          document.getElementById("printElement").innerHTML = data.html;
+          data.pageNum = $(".hiprint-printPaper").length;
+          $.fn.onImgLoaded(() => {
+            ipcRenderer.send("do", data);
+          });
+        });
+      });
+    </script>
+  </body>
+</html>
