@@ -60,6 +60,7 @@ async function initSocketIo() {
     client.emit("printerList", MAIN_WINDOW.webContents.getPrinters());
     client.on("news", (data) => {
     
+    
       if (data && data.html) {
         // 向并发中添加任务
         runner.add((done) => {

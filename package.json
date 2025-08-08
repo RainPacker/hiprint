@@ -80,6 +80,7 @@
   "dependencies": {
     "address": "^1.2.0",
     "concurrent-tasks": "^1.0.7",
+    "electron-hiprint": "file:",
     "ipp": "^2.0.1",
     "jquery": "^3.6.0",
     "node-machine-id": "^1.1.12",

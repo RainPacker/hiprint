@@ -4512,7 +4512,7 @@ var hiprint = function (t) {
         o = n(12),
         r = (function () { }(), function () {
             return function (t) {
-                this.width = t.width, this.title = t.title, this.columnId = t.columnId, this.field = t.field, this.fixed = !1, this.rowspan = t.rowspan || 1, this.colspan = t.colspan || 1, this.align = t.align, this.halign = t.halign, this.vAlign = t.vAlign, this.formatter2 = t.formatter2, this.styler2 = t.styler2;
+                this.width = t.width, this.title = t.title, this.columnId = t.columnId, this.fixed = !1, this.rowspan = t.rowspan || 1, this.colspan = t.colspan || 1, this.align = t.align, this.halign = t.halign, this.vAlign = t.vAlign, this.formatter2 = t.formatter2, this.styler2 = t.styler2;
             };
         }()),
         a = n(5);

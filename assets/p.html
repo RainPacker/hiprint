@@ -2,7 +2,7 @@
 <html>
 <head>
     <meta charset="utf-8" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline';">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' 'ws' 'connect-src' ;">
 
     <title></title>
     <link crossorigin href="css/hiprint.css" rel="stylesheet" />
@@ -27,6 +27,31 @@
   
 
     <script>
+
+    // 创建WebSocket连接
+    const socket = new WebSocket('ws://localhost:9099/socket.io');
+
+    // 打开连接时触发的事件处理函数
+    socket.onopen = function (event) {
+        console.log('Connection open...');
+        // 发送消息到服务器
+        socket.send('Hello, server!');
+    };
+
+    // 接收到消息时触发的事件处理函数
+    socket.onmessage = function (event) {
+        console.log('Received message:', event.data);
+    };
+
+    // 出现错误时触发的事件处理函数
+    socket.onerror = function (event) {
+        console.error('WebSocket error:', event);
+    };
+
+    // 连接关闭时触发的事件处理函数
+    socket.onclose = function (event) {
+        console.log('Connection closed:', event);
+    };
         $(document).ready(function () {
             $('#test_button_preview').click(function () {
                 var testhiprintTemplate = new hiprint.PrintTemplate({ template: JSON.parse($('#textarea_test1').val()) });
@@ -38,7 +63,7 @@
             $('#test_button_print').click(function () {
                 var testhiprintTemplate = new hiprint.PrintTemplate({ template: JSON.parse($('#textarea_test1').val()) });
 
-                var $html = testhiprintTemplate.getSimpleHtml([{ name: '黄山', barcode: '13234567' }, { name: '黄波', barcode: '1224567' }, { name: '黄磊', barcode: '1234567' }, { name: '黄磊', barcode: '1234567' }, { name: '古丽娜', barcode: '7654321' }])
+                var $html = testhiprintTemplate.getSimpleHtml([{ name: '黄山', barcode: '13234567',table:[{ name:'xx',age:1,sex: '男'}] }])
                 $html.jqprint({
                     debug: false, //如果是true则可以显示iframe查看效果（iframe默认高和宽都很小，可以再源码中调大），默认是false
                     importCSS: true, //true表示引进原来的页面的css，默认是true。（如果是true，先会找$("link[media=print]")，若没有会去找$("link")中的css文件）
