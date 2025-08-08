@@ -64,7 +64,7 @@
               console.log(data);
   
            let template =   new hiprint.PrintTemplate({ template:data.template});
-              let html =  template. (data.data)[0].innerHTML;
+          let html = template.getHtml(data.data)[0].innerHTML;
               data.html= html;
              ipc.send("htmlPrint", data);
               
