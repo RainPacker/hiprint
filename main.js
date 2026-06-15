@@ -6,13 +6,6 @@ const helper = require("./src/helper");
 const printSetup = require("./src/print");
 const { machineIdSync } = require("node-machine-id");
 const address = require("address");
-(function(window) {
- 
-/* Keep source code the same */
- 
-// })(typeof window == "undefined" ? global : window);
-// or
-})(this);
 
 // 主进程
 global.MAIN_WINDOW = null;
@@ -75,6 +68,12 @@ async function initialize() {
   app.on("window-all-closed", function() {
     if (process.platform !== "darwin") {
       helper.appQuit();
+    }
+  });
+  // 应用退出前持久化未完成的打印任务
+  app.on("before-quit", () => {
+    if (printSetup.flushPendingTasks) {
+      printSetup.flushPendingTasks();
     }
   });
 }
