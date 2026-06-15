@@ -5,18 +5,88 @@ const path = require("path");
 const helper = require("./helper");
 const address = require("address");
 const ipp = require("ipp");
-const TaskRunner = require("concurrent-tasks");
-const { contextBridge, ipcRenderer } = require('electron/renderer')
 
+// ========== 严格串行打印队列 ==========
+// 替代 concurrent-tasks，避免 taskId 重复导致队列卡死
 
+// 自增任务ID（解决时间戳并发重复问题）
+let _taskIdCounter = 0;
+function nextTaskId() {
+  return ++_taskIdCounter;
+}
 
-// 新建并发任务，并发数1
-const runner = new TaskRunner({
-  concurrency: 1,
-});
+// 任务队列
+const printQueue = [];
+// 是否正在处理任务
+let isPrinting = false;
+// 任务超时时间（毫秒），防止卡死
+const TASK_TIMEOUT = 30000;
+// 当前超时定时器
+let _currentTimer = null;
 
-// task map
-const taskMap = {};
+/**
+ * 将打印任务加入队列并尝试执行
+ * @param {Object} data - 打印数据
+ * @param {string} data.socketId - socket客户端ID
+ * @param {string} data.html - 打印HTML内容
+ */
+function enqueuePrintTask(data) {
+  const taskId = nextTaskId();
+  data.taskId = taskId;
+  printQueue.push(data);
+  MAIN_WINDOW.webContents.send("printTask", printQueue.length);
+  processNextTask();
+}
+
+/**
+ * 处理队列中的下一个任务
+ * 严格串行：只有当前任务完成后才会处理下一个
+ */
+function processNextTask() {
+  if (isPrinting || printQueue.length === 0) {
+    return;
+  }
+  isPrinting = true;
+  const data = printQueue.shift();
+
+  // 超时保护：防止打印回调永远不触发导致队列卡死
+  _currentTimer = setTimeout(() => {
+    console.error(`[print] 任务超时 taskId=${data.taskId}`);
+    onTaskDone(data.taskId, data.socketId, data.templateId, false, "打印超时");
+  }, TASK_TIMEOUT);
+
+  PRINT_WINDOW.webContents.send("print-new", data);
+}
+
+/**
+ * 任务完成回调
+ * @param {number} taskId - 任务ID
+ * @param {string} socketId - socket客户端ID
+ * @param {string} templateId - 模板ID
+ * @param {boolean} success - 是否成功
+ * @param {string} reason - 失败原因
+ */
+function onTaskDone(taskId, socketId, templateId, success, reason) {
+  // 清除超时定时器
+  if (_currentTimer) {
+    clearTimeout(_currentTimer);
+    _currentTimer = null;
+  }
+
+  const socket = socketStore[socketId];
+  if (socket) {
+    if (success) {
+      socket.emit("success", { msg: "打印成功", templateId: templateId });
+    } else {
+      socket.emit("error", { msg: reason || "打印失败", templateId: templateId });
+    }
+  }
+
+  isPrinting = false;
+  MAIN_WINDOW.webContents.send("printTask", printQueue.length);
+  // 继续处理下一个任务
+  processNextTask();
+}
 
 // 托盘
 async function initTray() {
@@ -59,21 +129,10 @@ async function initSocketIo() {
     // data:{printer:option.printer,html:htmlstr}
     client.emit("printerList", MAIN_WINDOW.webContents.getPrinters());
     client.on("news", (data) => {
-    
-    
       if (data && data.html) {
-        // 向并发中添加任务
-        runner.add((done) => {
-          data.printer = data.printer;
-          data.socketId = client.id;
-          // 使用时间戳作为并发任务id
-          let taskId = new Date().getTime();
-          // 在taskMap中添加任务done事件
-          taskMap[taskId] = done;
-          data.taskId = taskId;
-          PRINT_WINDOW.webContents.send("print-new", data);
-        });
-        MAIN_WINDOW.webContents.send("printTask", Object.keys(taskMap).length);
+        data.printer = data.printer;
+        data.socketId = client.id;
+        enqueuePrintTask(data);
       }
     });
     // 从服务端非前端
@@ -234,24 +293,11 @@ async function createPrintWindow() {
 
 function initPrintEvent() {
   ipcMain.on("do", (event, data) => {
-    // socket.emit('news', { id: 1 })
-    let socket = socketStore[data.socketId];
     const printers = PRINT_WINDOW.webContents.getPrinters();
     let havePrinter = false;
     let defaultPrinter = "";
     printers.forEach((element) => {
       if (element.name === data.printer) {
-        // if (element.status != 0) {
-        //   if (socket) {
-        //     socket.emit("error", {
-        //       msg: data.printer + "打印机异常",
-        //       templateId: data.templateId,
-        //     });
-        //     // 通过taskMap 调用 task done 回调
-        //     taskMap[data.taskId]();
-        //   }
-        //   return;
-        // }
         havePrinter = true;
       }
       if (element.isDefault) {
@@ -282,42 +328,15 @@ function initPrintEvent() {
         pageSize: data.pageSize, // 打印纸张
       },
       (success, failureReason) => {
-        if (socket) {
-          success
-            ? socket.emit("success", {
-                msg: "打印机成功",
-                templateId: data.templateId,
-              })
-            : socket.emit("error", {
-                msg: failureReason,
-                templateId: data.templateId,
-              });
-        }
-        // 通过taskMap 调用 task done 回调
-        taskMap[data.taskId]();
-        // 删除 task
-        delete taskMap[data.taskId];
-        MAIN_WINDOW.webContents.send("printTask", Object.keys(taskMap).length);
+        onTaskDone(data.taskId, data.socketId, data.templateId, success, failureReason);
       }
     );
   });
   // 收到ui 给的html 代码
-  ipcMain.on("htmlPrint",(event, data)=> {
-    let socket = socketStore[data.socketId];
-   // console.log(data);
-    // 此时hmtl 已经有了
+  ipcMain.on("htmlPrint", (event, data) => {
     if (data && data.html) {
-      // 向并发中添加任务
-      runner.add((done) => {
-        data.printer = data.printer;
-        // 使用时间戳作为并发任务id
-        let taskId = new Date().getTime();
-        // 在taskMap中添加任务done事件
-        taskMap[taskId] = done;
-        data.taskId = taskId;
-        PRINT_WINDOW.webContents.send("print-new", data);
-      });
-      MAIN_WINDOW.webContents.send("printTask", Object.keys(taskMap).length);
+      data.printer = data.printer;
+      enqueuePrintTask(data);
     }
   });
 }
