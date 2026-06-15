@@ -62,12 +62,16 @@
       window.onload = () => {
         ipc.on("getHtml",(event,data)=>{
               console.log(data);
-  
-           let template =   new hiprint.PrintTemplate({ template:data.template});
-          let html = template.getHtml(data.data)[0].innerHTML;
-              data.html= html;
-             ipc.send("htmlPrint", data);
-              
+              try {
+                let template = new hiprint.PrintTemplate({ template:data.template});
+                let html = template.getHtml(data.data)[0].innerHTML;
+                data.html= html;
+                ipc.send("htmlPrint", data);
+              } catch (err) {
+                console.error("[getHtml] 模板渲染失败:", err);
+                data.renderError = err.message || "模板渲染失败";
+                ipc.send("htmlPrintError", data);
+              }
         })
         ipc.send("getMachineId");
         ipc.on("machineId", (event, arg) => {

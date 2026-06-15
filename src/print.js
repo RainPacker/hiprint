@@ -20,10 +20,16 @@ function nextTaskId() {
 
 // 任务超时时间（毫秒）
 const TASK_TIMEOUT = 30000;
+// 模板渲染超时时间（毫秒）
+const RENDER_TIMEOUT = 15000;
 
 // 打印机队列映射表
 // key: 打印机名称, value: { queue: [], isPrinting: boolean, window: BrowserWindow|null, timer: NodeJS.Timeout|null }
 const printerQueues = new Map();
+
+// 渲染中的任务映射表（news-server 专用）
+// key: taskId, value: { data, socketId, timer }
+const renderingTasks = new Map();
 
 /**
  * 获取或创建指定打印机的队列
@@ -75,8 +81,10 @@ function resolvePrinterName(requestedPrinter) {
  * 将打印任务加入对应打印机的队列
  */
 function enqueuePrintTask(data) {
-  const taskId = nextTaskId();
-  data.taskId = taskId;
+  // news-server 已在入队前分配了 taskId，不要覆盖
+  if (!data.taskId) {
+    data.taskId = nextTaskId();
+  }
 
   // 解析实际打印机名称
   const printerName = resolvePrinterName(data.printer);
@@ -86,8 +94,10 @@ function enqueuePrintTask(data) {
   const pq = getPrinterQueue(printerName);
   pq.queue.push(data);
 
-  // 持久化：入队时写入本地文件
-  store.addTask(data);
+  // 持久化：news-server 已在渲染前写入，这里只对 news 接口写入
+  if (!renderingTasks.has(data.taskId)) {
+    store.addTask(data);
+  }
 
   MAIN_WINDOW.webContents.send("printTask", getTotalPendingCount());
   processNextTask(printerName);
@@ -214,15 +224,32 @@ function restorePendingTasks() {
   });
   _taskIdCounter = maxId;
 
-  // 按打印机分组入队
+  // 分为两类：有 html 的直接入打印队列，无 html 的需要重新渲染
+  const printReady = [];
+  const needRender = [];
+
   pendingTasks.forEach((taskData) => {
     const printerName = taskData._resolvedPrinter || taskData.printer;
     if (!printerName) {
-      // 无法确定打印机的任务，从持久化中移除
       store.removeTask(taskData.taskId);
       return;
     }
 
+    if (taskData.html) {
+      // 已有 html，直接入打印队列
+      printReady.push(taskData);
+    } else if (taskData.template) {
+      // 只有 template 没有 html，需要重新渲染（news-server 任务）
+      needRender.push(taskData);
+    } else {
+      // 既没有 html 也没有 template，无法处理，移除
+      store.removeTask(taskData.taskId);
+    }
+  });
+
+  // 有 html 的任务直接入打印队列
+  printReady.forEach((taskData) => {
+    const printerName = taskData._resolvedPrinter || taskData.printer;
     const pq = getPrinterQueue(printerName);
     pq.queue.push(taskData);
   });
@@ -235,6 +262,27 @@ function restorePendingTasks() {
       processNextTask(printerName);
     }
   });
+
+  // 需要重新渲染的任务，延迟发送 getHtml（等 MAIN_WINDOW 加载完成）
+  if (needRender.length > 0) {
+    console.log(`[store] ${needRender.length} 个任务需要重新渲染模板`);
+    // 延迟 1 秒确保 MAIN_WINDOW 已加载 hiprint
+    setTimeout(() => {
+      needRender.forEach((taskData) => {
+        // 重新设置渲染超时保护
+        renderingTasks.set(taskData.taskId, {
+          data: taskData,
+          socketId: taskData.socketId,
+          timer: setTimeout(() => {
+            console.error(`[print] 恢复任务渲染超时 taskId=${taskData.taskId}`);
+            renderingTasks.delete(taskData.taskId);
+            store.removeTask(taskData.taskId);
+          }, RENDER_TIMEOUT),
+        });
+        MAIN_WINDOW.webContents.send("getHtml", taskData);
+      });
+    }, 1000);
+  }
 }
 
 /**
@@ -255,6 +303,13 @@ function flushPendingTasks() {
       store.addTask(data);
     });
   });
+
+  // 渲染中的任务也要写入（下次启动会重试渲染）
+  renderingTasks.forEach((rendering) => {
+    clearTimeout(rendering.timer);
+    store.addTask(rendering.data);
+  });
+  renderingTasks.clear();
 }
 
 // ========== 托盘 ==========
@@ -301,7 +356,7 @@ async function initSocketIo() {
         enqueuePrintTask(data);
       }
     });
-    // 从服务端非前端
+    // 从服务端非前端（先持久化再渲染，防止中间环节丢失）
     client.on("news-server", (data) => {
       try {
         data = JSON.parse(data);
@@ -309,6 +364,29 @@ async function initSocketIo() {
         data = data;
       }
       data.socketId = client.id;
+
+      // 先分配 taskId 并持久化，确保任务不丢失
+      const taskId = nextTaskId();
+      data.taskId = taskId;
+      data._resolvedPrinter = data.printer;
+      // 标记为渲染中状态（还未生成 html）
+      store.addTask({ ...data, status: "rendering" });
+
+      // 记录渲染中的任务，用于超时保护
+      renderingTasks.set(taskId, {
+        data: data,
+        socketId: client.id,
+        timer: setTimeout(() => {
+          console.error(`[print] 模板渲染超时 taskId=${taskId}`);
+          renderingTasks.delete(taskId);
+          store.removeTask(taskId);
+          const socket = socketStore[client.id];
+          if (socket) {
+            socket.emit("error", { msg: "模板渲染超时", templateId: data.templateId });
+          }
+        }, RENDER_TIMEOUT),
+      });
+
       MAIN_WINDOW.webContents.send("getHtml", data);
     });
     // 刷新打印机列表
@@ -480,11 +558,37 @@ function initPrintEvent() {
     );
   });
 
-  // 收到 UI 给的 html 代码
+  // 收到 UI 给的 html 代码（news-server 渲染完成后回调）
   ipcMain.on("htmlPrint", (event, data) => {
     if (data && data.html) {
+      // 清除渲染超时定时器
+      const rendering = renderingTasks.get(data.taskId);
+      if (rendering) {
+        clearTimeout(rendering.timer);
+        renderingTasks.delete(data.taskId);
+      }
       data.printer = data.printer;
       enqueuePrintTask(data);
+    }
+  });
+
+  // 模板渲染失败回调
+  ipcMain.on("htmlPrintError", (event, data) => {
+    // 清除渲染超时定时器
+    const rendering = renderingTasks.get(data.taskId);
+    if (rendering) {
+      clearTimeout(rendering.timer);
+      renderingTasks.delete(data.taskId);
+    }
+    // 从持久化中移除
+    store.removeTask(data.taskId);
+    // 通知客户端渲染失败
+    const socket = socketStore[data.socketId];
+    if (socket) {
+      socket.emit("error", {
+        msg: data.renderError || "模板渲染失败",
+        templateId: data.templateId,
+      });
     }
   });
 }
