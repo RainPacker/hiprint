@@ -59,11 +59,38 @@
       
       const { ipcRenderer } = require("electron");
       let ipc = ipcRenderer;        
+
+      // 扁平化嵌套对象，将 {a:{b:1}} 转为 {"a.b":1}，支持模板字段名带点号
+      function flattenObject(obj, prefix) {
+        var result = {};
+        if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+          return obj;
+        }
+        for (var key in obj) {
+          if (!obj.hasOwnProperty(key)) continue;
+          var newKey = prefix ? prefix + "." + key : key;
+          var val = obj[key];
+          if (val && typeof val === "object" && !Array.isArray(val)) {
+            // 递归扁平化嵌套对象
+            var flat = flattenObject(val, newKey);
+            for (var fk in flat) {
+              if (flat.hasOwnProperty(fk)) result[fk] = flat[fk];
+            }
+          } else {
+            result[newKey] = val;
+          }
+        }
+        return result;
+      }
+
       window.onload = () => {
         ipc.on("getHtml",(event,data)=>{
               console.log(data);
               try {
                 let template = new hiprint.PrintTemplate({ template:data.template});
+                // 扁平化嵌套对象，支持字段名带点号(如 tMomPpFlowCard.flowCardCode)
+                // hiprint 使用 t[field] 直接取值，不解析点号路径，需将嵌套对象展开为带点号的扁平键
+                data.data = flattenObject(data.data);
                 let html = template.getHtml(data.data)[0].innerHTML;
                 data.html= html;
                 ipc.send("htmlPrint", data);
