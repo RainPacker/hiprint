@@ -1,6 +1,6 @@
 {
   "name": "electron-hiprint",
-  "version": "1.0.11",
+  "version": "1.0.12",
   "description": "vue-plugin-hiprint client",
   "main": "main.js",
   "author": "254856090@qq.com",
@@ -27,6 +27,11 @@
       "output": "out"
     },
     "asar": true,
+    "asarUnpack": [
+      "node_modules/node-machine-id/**/*",
+      "node_modules/ipp/**/*",
+      "assets/**/*"
+    ],
     "files": [
       "**/*"
     ],

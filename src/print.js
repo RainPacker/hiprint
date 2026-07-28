@@ -133,7 +133,8 @@ function processNextTask(printerName) {
   };
 
   if (isNew) {
-    win.webContents.on("dom-ready", sendPrintNew);
+    // 使用 once 避免重复监听
+    win.webContents.once("dom-ready", sendPrintNew);
   } else {
     sendPrintNew();
   }
@@ -160,8 +161,10 @@ function ensurePrinterWindow(printerName) {
   };
 
   const win = new BrowserWindow(windowOptions);
-  let printHtml = path.join("file://", app.getAppPath(), "/assets/print.html");
-  win.loadURL(printHtml);
+  // 打包后 app.getAppPath() 返回 .asar 路径，Electron 能自动处理 asar 内文件读取
+  // 但为兼容性考虑，使用 __dirname 构建路径更可靠
+  let printHtml = path.join(__dirname, "../assets/print.html");
+  win.loadURL("file://" + printHtml);
 
   win.on("closed", () => {
     pq.window = null;
@@ -314,7 +317,7 @@ function flushPendingTasks() {
 
 // ========== 托盘 ==========
 async function initTray() {
-  let trayPath = path.join(app.getAppPath(), "/assets/icons/tray.png");
+  let trayPath = path.join(__dirname, "../assets/icons/tray.png");
   APP_TRAY = new Tray(trayPath);
   APP_TRAY.setToolTip("hiprint");
   let trayMenuTemplate = [
@@ -499,11 +502,15 @@ async function initSocketIo() {
     });
     MAIN_WINDOW.webContents.send("connection", socketList);
   });
-  try {
-    server.listen(17521);
-  } catch (error) {
-    alert("服务已开启/端口被占用");
-  }
+  server.listen(17521);
+  // 端口监听错误通过事件触发，try-catch 无法捕获
+  server.on("error", (error) => {
+    if (error.code === "EADDRINUSE") {
+      console.error("[socket] 端口 17521 已被占用，请检查是否有其他实例运行");
+    } else {
+      console.error("[socket] 服务启动失败:", error.message);
+    }
+  });
 }
 
 // ========== 打印事件 ==========

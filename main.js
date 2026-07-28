@@ -4,8 +4,13 @@ const path = require("path");
 const server = require("http").createServer();
 const helper = require("./src/helper");
 const printSetup = require("./src/print");
-const { machineIdSync } = require("node-machine-id");
 const address = require("address");
+
+// Windows Server 缺少 GPU 驱动时，Chromium 渲染会崩溃闪退
+// 必须在 app.ready 之前设置
+app.commandLine.appendSwitch("disable-gpu");
+app.commandLine.appendSwitch("no-sandbox");
+app.commandLine.appendSwitch("disable-software-rasterizer");
 
 // 主进程
 global.MAIN_WINDOW = null;
@@ -38,6 +43,14 @@ const io = require("socket.io")(server, {
 global.io = io;
 
 global.socketStore = {};
+
+// 全局异常捕获，防止未处理异常导致闪退
+process.on("uncaughtException", (error) => {
+  console.error("[uncaughtException]", error);
+});
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[unhandledRejection]", reason);
+});
 
 // 初始化
 async function initialize() {
@@ -115,11 +128,13 @@ async function createWindow() {
 
   // 系统相关
   await systemSetup();
-  // 加载主页面
-  let indexHtml = path.join("file://", __dirname, "/assets/index.html");
-  MAIN_WINDOW.webContents.loadURL(indexHtml);
-  MAIN_WINDOW.webContents.openDevTools();
-  // MAIN_WINDOW.webContents.openDevTools();
+  // 加载主页面（打包后需处理 asar 路径）
+  let indexPath = path.join(__dirname, "/assets/index.html");
+  MAIN_WINDOW.webContents.loadURL("file://" + indexPath);
+  // 仅在开发环境打开 DevTools，生产环境打开可能导致 WinServer 渲染异常
+  if (process.env.NODE_ENV !== "production") {
+    MAIN_WINDOW.webContents.openDevTools();
+  }
   // 退出
   MAIN_WINDOW.on("closed", () => {
     MAIN_WINDOW = null;
@@ -150,8 +165,8 @@ async function loadingView(windowOptions) {
     height: windowOptions.height,
   });
 
-  const loadingHtml = path.join("file://", __dirname, "/assets/loading.html");
-  loadingBrowserView.webContents.loadURL(loadingHtml);
+  const loadingHtml = path.join(__dirname, "/assets/loading.html");
+  loadingBrowserView.webContents.loadURL("file://" + loadingHtml);
 
   MAIN_WINDOW.webContents.on("dom-ready", async (event) => {
     MAIN_WINDOW.removeBrowserView(loadingBrowserView);
@@ -167,7 +182,14 @@ async function systemSetup() {
 
 // 获取设备唯一id
 ipcMain.on("getMachineId", function(event) {
-  event.sender.send("machineId", machineIdSync({ original: true }));
+  try {
+    const { machineIdSync } = require("node-machine-id");
+    event.sender.send("machineId", machineIdSync({ original: true }));
+  } catch (err) {
+    console.error("[getMachineId] 获取机器ID失败:", err.message);
+    // 回退：使用用户数据目录路径作为简易唯一标识
+    event.sender.send("machineId", app.getPath("userData").replace(/[\\\/]/g, "_"));
+  }
 });
 
 // 获取设备ip、mac等信息
