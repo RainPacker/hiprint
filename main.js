@@ -24,20 +24,28 @@ app.commandLine.appendSwitch("disable-backgrounding-occluded-windows");
 
 // 设置进程为高优先级，确保打印任务及时响应
 // Windows 优先级：32=Normal, 128=High, 256=Realtime(需管理员)
-// 使用 wmic 命令设置最可靠，os.setPriority 在 Windows 上行为不一致
+// WinServer 2025 已移除 wmic，需多级 fallback
 global.PROCESS_PRIORITY = "普通";
 try {
-  execSync(`wmic process where processid=${process.pid} call setpriority 128`, { stdio: "ignore" });
+  // 方法1：PowerShell（WinServer 2025 推荐）
+  execSync(`powershell -Command "Get-Process -Id ${process.pid} | Set-Process -Priority High"`, { stdio: "ignore" });
   global.PROCESS_PRIORITY = "高";
-  console.log("[priority] 进程优先级已设置为高");
+  console.log("[priority] 进程优先级已设置为高(powershell)");
 } catch (err) {
-// wmic 失败则尝试 os.setPriority
   try {
-    os.setPriority(process.pid, "high");
+// 方法2：wmic（旧版 Windows 兼容）
+    execSync(`wmic process where processid=${process.pid} call setpriority 128`, { stdio: "ignore" });
     global.PROCESS_PRIORITY = "高";
-    console.log("[priority] 进程优先级已设置为高(os.setPriority)");
+    console.log("[priority] 进程优先级已设置为高(wmic)");
   } catch (err2) {
-    logError("setPriority", err2);
+    try {
+      // 方法3：os.setPriority（数字参数，Node.js 14 不支持字符串）
+      os.setPriority(process.pid, -14);
+      global.PROCESS_PRIORITY = "高";
+      console.log("[priority] 进程优先级已设置为高(os.setPriority)");
+    } catch (err3) {
+      logError("setPriority", err3);
+    }
   }
 }
 
