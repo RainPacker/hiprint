@@ -2,6 +2,8 @@
 const { app } = require("electron");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
+const { execSync } = require("child_process");
 
 /**
  * 崩溃日志目录
@@ -76,6 +78,35 @@ function safeGetPrinters() {
 }
 
 /**
+ * 设置指定进程为高优先级
+ * 策略：先尝试 Realtime(256)，失败降级到 High(128)，再失败用 os.setPriority
+ * @param {number} pid - 目标进程ID
+ * @returns {string} 实际设置的优先级标签
+ */
+function setProcessHighPriority(pid) {
+  const priorityChain = [
+    { fn: () => execSync(`powershell -Command "Get-Process -Id ${pid} | Set-Process -Priority RealTime"`, { stdio: "ignore" }), label: "实时" },
+    { fn: () => execSync(`wmic process where processid=${pid} call setpriority 256`, { stdio: "ignore" }), label: "实时" },
+    { fn: () => { os.setPriority(pid, -20); }, label: "实时" },
+    { fn: () => execSync(`powershell -Command "Get-Process -Id ${pid} | Set-Process -Priority High"`, { stdio: "ignore" }), label: "高" },
+    { fn: () => execSync(`wmic process where processid=${pid} call setpriority 128`, { stdio: "ignore" }), label: "高" },
+    { fn: () => { os.setPriority(pid, -14); }, label: "高" },
+  ];
+
+  for (const item of priorityChain) {
+    try {
+      item.fn();
+      console.log(`[priority] PID=${pid} 优先级已设置为${item.label}`);
+      return item.label;
+    } catch (err) {
+      // 继续尝试下一个方法
+    }
+  }
+  logError("setProcessHighPriority", `PID=${pid} 所有优先级设置方法均失败`);
+  return "普通";
+}
+
+/**
  * 应用配置文件路径
  */
 function getConfigFile() {
@@ -138,5 +169,6 @@ exports.logError = logError;
 exports.isMainWindowAvailable = isMainWindowAvailable;
 exports.safeSendToMain = safeSendToMain;
 exports.safeGetPrinters = safeGetPrinters;
+exports.setProcessHighPriority = setProcessHighPriority;
 exports.saveConfig = saveConfig;
 exports.getConfig = getConfig;

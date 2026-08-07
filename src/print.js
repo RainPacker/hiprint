@@ -3,7 +3,7 @@
 const { app, BrowserWindow, ipcMain, Tray, Menu } = require("electron");
 const path = require("path");
 const helper = require("./helper");
-const { logError, safeSendToMain, safeGetPrinters, isMainWindowAvailable, saveConfig } = helper;
+const { logError, safeSendToMain, safeGetPrinters, isMainWindowAvailable, saveConfig, setProcessHighPriority } = helper;
 const address = require("address");
 const ipp = require("ipp");
 const store = require("./store");
@@ -168,6 +168,17 @@ function ensurePrinterWindow(printerName) {
   };
 
   const win = new BrowserWindow(windowOptions);
+
+  // 设置打印窗口渲染进程（子进程）为高优先级，确保打印任务及时响应
+  try {
+    const rendererPid = win.webContents.getProcessId();
+    if (rendererPid > 0) {
+      setProcessHighPriority(rendererPid);
+    }
+  } catch (err) {
+    logError("printWindow-priority", err);
+  }
+
   // 打包后 app.getAppPath() 返回 .asar 路径，Electron 能自动处理 asar 内文件读取
   // 但为兼容性考虑，使用 __dirname 构建路径更可靠
   let printHtml = path.join(__dirname, "../assets/print.html");
