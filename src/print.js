@@ -217,14 +217,17 @@ function createPrinterWindow() {
   const win = new BrowserWindow(windowOptions);
 
   // 设置打印窗口渲染进程（子进程）为高优先级
-  try {
-    const rendererPid = win.webContents.getProcessId();
-    if (rendererPid > 0) {
-      setProcessHighPriority(rendererPid);
+  // 渲染进程在 dom-ready 时才真正创建，此时 getProcessId() 才返回真实 PID
+  win.webContents.once("dom-ready", () => {
+    try {
+      const rendererPid = win.webContents.getProcessId();
+      if (rendererPid > 0) {
+        setProcessHighPriority(rendererPid);
+      }
+    } catch (err) {
+      logError("printWindow-priority", err);
     }
-  } catch (err) {
-    logError("printWindow-priority", err);
-  }
+  });
 
   let printHtml = path.join(__dirname, "../assets/print.html");
   win.loadURL("file://" + printHtml);

@@ -168,14 +168,17 @@ async function createWindow() {
   MAIN_WINDOW = new BrowserWindow(windowOptions);
 
   // 设置主窗口渲染进程为高优先级
-  try {
-    const rendererPid = MAIN_WINDOW.webContents.getProcessId();
-    if (rendererPid > 0) {
-      setProcessHighPriority(rendererPid);
+  // 渲染进程在 dom-ready 时才真正创建，此时 getProcessId() 才返回真实 PID
+  MAIN_WINDOW.webContents.once("dom-ready", () => {
+    try {
+      const rendererPid = MAIN_WINDOW.webContents.getProcessId();
+      if (rendererPid > 0) {
+        setProcessHighPriority(rendererPid);
+      }
+    } catch (err) {
+      logError("mainWindow-priority", err);
     }
-  } catch (err) {
-    logError("mainWindow-priority", err);
-  }
+  });
 
   // 开机启动时带 --hidden 参数，静默启动到托盘
   const startHidden = process.argv.includes("--hidden");
