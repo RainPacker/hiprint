@@ -2,6 +2,7 @@ const { app, BrowserWindow, BrowserView, ipcMain, Menu } = require("electron");
 
 const path = require("path");
 const os = require("os");
+const { execSync } = require("child_process");
 const server = require("http").createServer();
 const helper = require("./src/helper");
 const { logError } = helper;
@@ -23,10 +24,21 @@ app.commandLine.appendSwitch("disable-backgrounding-occluded-windows");
 
 // 设置进程为高优先级，确保打印任务及时响应
 // Windows 优先级：32=Normal, 128=High, 256=Realtime(需管理员)
+// 使用 wmic 命令设置最可靠，os.setPriority 在 Windows 上行为不一致
+global.PROCESS_PRIORITY = "普通";
 try {
-  os.setPriority(process.pid, "high");
+  execSync(`wmic process where processid=${process.pid} call setpriority 128`, { stdio: "ignore" });
+  global.PROCESS_PRIORITY = "高";
+  console.log("[priority] 进程优先级已设置为高");
 } catch (err) {
-  logError("setPriority", err);
+// wmic 失败则尝试 os.setPriority
+  try {
+    os.setPriority(process.pid, "high");
+    global.PROCESS_PRIORITY = "高";
+    console.log("[priority] 进程优先级已设置为高(os.setPriority)");
+  } catch (err2) {
+    logError("setPriority", err2);
+  }
 }
 
 // 主进程
@@ -93,16 +105,10 @@ function setAutoLaunch(enable) {
 
 /**
  * 读取当前开机启动状态
+ * 直接返回 global.AUTO_START，避免 app.getLoginItemSettings() 在部分环境返回不准
  */
 function getAutoLaunch() {
-  try {
-    const settings = app.getLoginItemSettings();
-    global.AUTO_START = settings.openAtLogin;
-    return settings.openAtLogin;
-  } catch (err) {
-    logError("getAutoLaunch", err);
-    return false;
-  }
+  return global.AUTO_START;
 }
 
 // 初始化
@@ -122,8 +128,8 @@ async function initialize() {
   });
   // 当electron完成初始化
   app.whenReady().then(() => {
-    // 读取当前开机启动状态
-    getAutoLaunch();
+    // 默认开启开机启动
+    setAutoLaunch(true);
     // 创建浏览器窗口
     createWindow();
     app.on("activate", function() {
@@ -288,23 +294,7 @@ ipcMain.on("getAutoStartStatus", function (event) {
 
 // 获取进程优先级
 ipcMain.on("getProcessPriority", function (event) {
-  let priorityLabel = "普通";
-  try {
-    const priority = os.getPriority(process.pid);
-    // Windows: 32=Normal, 128=High, 256=Realtime
-    if (priority >= 128 && priority < 256) {
-      priorityLabel = "高";
-    } else if (priority >= 256) {
-      priorityLabel = "实时";
-    } else if (priority >= 32 && priority < 128) {
-      priorityLabel = "普通";
-    } else {
-      priorityLabel = "低";
-    }
-  } catch (err) {
-    logError("getProcessPriority", err);
-  }
-  event.sender.send("processPriority", priorityLabel);
+  event.sender.send("processPriority", global.PROCESS_PRIORITY || "普通");
 });
 
 
