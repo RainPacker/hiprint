@@ -107,6 +107,32 @@ function setProcessHighPriority(pid) {
 }
 
 /**
+ * 批量设置当前应用的所有同名进程为高优先级
+ * 打包后所有子进程（Main/Renderer/GPU/Network/Utility）可执行文件名相同
+ * 用 PowerShell 按进程名批量设置，覆盖 Chromium 内部进程
+ * @returns {string} 优先级标签
+ */
+function setAllProcessesHighPriority() {
+  const execName = path.basename(process.execPath, ".exe");
+  const priorityChain = [
+    { fn: () => execSync(`powershell -Command "Get-Process ${execName} -ErrorAction SilentlyContinue | Set-Process -Priority RealTime"`, { stdio: "ignore" }), label: "实时" },
+    { fn: () => execSync(`powershell -Command "Get-Process ${execName} -ErrorAction SilentlyContinue | Set-Process -Priority High"`, { stdio: "ignore" }), label: "高" },
+  ];
+
+  for (const item of priorityChain) {
+    try {
+      item.fn();
+      console.log(`[priority] 所有 "${execName}" 进程优先级已设置为${item.label}`);
+      return item.label;
+    } catch (err) {
+      // 继续尝试下一个方法
+    }
+  }
+  logError("setAllProcessesHighPriority", `批量设置 "${execName}" 进程优先级失败`);
+  return "普通";
+}
+
+/**
  * 应用配置文件路径
  */
 function getConfigFile() {
@@ -170,5 +196,6 @@ exports.isMainWindowAvailable = isMainWindowAvailable;
 exports.safeSendToMain = safeSendToMain;
 exports.safeGetPrinters = safeGetPrinters;
 exports.setProcessHighPriority = setProcessHighPriority;
+exports.setAllProcessesHighPriority = setAllProcessesHighPriority;
 exports.saveConfig = saveConfig;
 exports.getConfig = getConfig;

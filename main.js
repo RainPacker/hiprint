@@ -3,7 +3,7 @@ const { app, BrowserWindow, BrowserView, ipcMain, Menu } = require("electron");
 const path = require("path");
 const server = require("http").createServer();
 const helper = require("./src/helper");
-const { logError, saveConfig, getConfig, setProcessHighPriority } = helper;
+const { logError, saveConfig, getConfig, setProcessHighPriority, setAllProcessesHighPriority } = helper;
 const printSetup = require("./src/print");
 const address = require("address");
 
@@ -115,6 +115,9 @@ async function initialize() {
     // 读取用户上次的开机启动配置，首次启动默认开启
     const savedAutoStart = getConfig("autoStart", true);
     setAutoLaunch(savedAutoStart);
+    // 批量设置所有同名进程（Main/Renderer/GPU/Network/Utility）为高优先级
+    // 此时 Chromium 各子进程已创建，按进程名一次性覆盖
+    global.PROCESS_PRIORITY = setAllProcessesHighPriority();
     // 创建浏览器窗口
     createWindow();
     app.on("activate", function() {
@@ -166,19 +169,6 @@ async function createWindow() {
   }
 
   MAIN_WINDOW = new BrowserWindow(windowOptions);
-
-  // 设置主窗口渲染进程为高优先级
-  // 渲染进程在 dom-ready 时才真正创建，此时 getProcessId() 才返回真实 PID
-  MAIN_WINDOW.webContents.once("dom-ready", () => {
-    try {
-      const rendererPid = MAIN_WINDOW.webContents.getProcessId();
-      if (rendererPid > 0) {
-        setProcessHighPriority(rendererPid);
-      }
-    } catch (err) {
-      logError("mainWindow-priority", err);
-    }
-  });
 
   // 开机启动时带 --hidden 参数，静默启动到托盘
   const startHidden = process.argv.includes("--hidden");
