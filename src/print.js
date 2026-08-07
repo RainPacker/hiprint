@@ -23,9 +23,13 @@ function nextTaskId() {
 const TASK_TIMEOUT = 30000;
 // 模板渲染超时时间（毫秒）
 const RENDER_TIMEOUT = 15000;
+// 空闲窗口回收延时（毫秒），打印完成后空闲此时间则自动销毁
+const IDLE_WINDOW_TIMEOUT = 60000;
+// 最少保留的窗口数，空闲回收时不低于此数量
+const MIN_KEEP_WINDOWS = 10;
 
 // 打印机队列映射表
-// key: 打印机名称, value: { queue: [], isPrinting: boolean, window: BrowserWindow|null, timer: NodeJS.Timeout|null }
+// key: 打印机名称, value: { queue: [], isPrinting: boolean, window: BrowserWindow|null, timer: NodeJS.Timeout|null, idleTimer: NodeJS.Timeout|null }
 const printerQueues = new Map();
 
 // 渲染中的任务映射表（news-server 专用）
@@ -40,9 +44,10 @@ function getPrinterQueue(printerName) {
     printerQueues.set(printerName, {
       queue: [],
       isPrinting: false,
-      currentTask: null, // 当前正在打印的任务数据
+      currentTask: null,
       window: null,
       timer: null,
+      idleTimer: null, // 空闲窗口自动回收定时器
     });
   }
   return printerQueues.get(printerName);
@@ -148,15 +153,57 @@ function processNextTask(printerName) {
 }
 
 /**
- * 确保打印机的 BrowserWindow 已创建
- * @returns {{ window: BrowserWindow, isNew: boolean }}
+ * 统计当前活跃的打印窗口数
+ * @returns {number}
  */
-function ensurePrinterWindow(printerName) {
-  const pq = getPrinterQueue(printerName);
-  if (pq.window && !pq.window.isDestroyed()) {
-    return { window: pq.window, isNew: false };
-  }
+function countActiveWindows() {
+  let count = 0;
+  printerQueues.forEach((pq) => {
+    if (pq.window && !pq.window.isDestroyed()) {
+      count++;
+    }
+  });
+  return count;
+}
 
+/**
+ * 查找一个空闲窗口（非打印中、队列为空）并从原队列中剥离
+ * @returns {BrowserWindow|null}
+ */
+function findAndDetachIdleWindow() {
+  let idleEntry = null;
+  let idleKey = null;
+  printerQueues.forEach((pq, key) => {
+    if (
+      pq.window &&
+      !pq.window.isDestroyed() &&
+      !pq.isPrinting &&
+      pq.queue.length === 0
+    ) {
+      idleEntry = pq;
+      idleKey = key;
+    }
+  });
+
+  if (idleEntry && idleKey) {
+    const win = idleEntry.window;
+    // 取消原队列的空闲回收定时器
+    if (idleEntry.idleTimer) {
+      clearTimeout(idleEntry.idleTimer);
+      idleEntry.idleTimer = null;
+    }
+    idleEntry.window = null;
+    console.log(`[printWindow] 复用空闲窗口，从打印机 "${idleKey}" 剥离`);
+    return win;
+  }
+  return null;
+}
+
+/**
+ * 创建新的打印窗口
+ * @returns {BrowserWindow}
+ */
+function createPrinterWindow() {
   const windowOptions = {
     width: 100,
     height: 100,
@@ -169,7 +216,7 @@ function ensurePrinterWindow(printerName) {
 
   const win = new BrowserWindow(windowOptions);
 
-  // 设置打印窗口渲染进程（子进程）为高优先级，确保打印任务及时响应
+  // 设置打印窗口渲染进程（子进程）为高优先级
   try {
     const rendererPid = win.webContents.getProcessId();
     if (rendererPid > 0) {
@@ -179,17 +226,51 @@ function ensurePrinterWindow(printerName) {
     logError("printWindow-priority", err);
   }
 
-  // 打包后 app.getAppPath() 返回 .asar 路径，Electron 能自动处理 asar 内文件读取
-  // 但为兼容性考虑，使用 __dirname 构建路径更可靠
   let printHtml = path.join(__dirname, "../assets/print.html");
   win.loadURL("file://" + printHtml);
+  return win;
+}
+
+/**
+ * 确保打印机的 BrowserWindow 已创建
+ * 策略：1.已有窗口直接复用 2.优先复用其他队列的空闲窗口 3.无空闲则创建新窗口
+ * @returns {{ window: BrowserWindow, isNew: boolean }}
+ */
+function ensurePrinterWindow(printerName) {
+  const pq = getPrinterQueue(printerName);
+
+  // 1. 当前队列已有可用窗口，直接复用
+  if (pq.window && !pq.window.isDestroyed()) {
+    // 取消空闲回收定时器（窗口即将被使用）
+    if (pq.idleTimer) {
+      clearTimeout(pq.idleTimer);
+      pq.idleTimer = null;
+    }
+    return { window: pq.window, isNew: false };
+  }
+
+  let win = null;
+  let isNew = false;
+
+  // 2. 优先复用其他队列的空闲窗口
+  win = findAndDetachIdleWindow();
+  if (win) {
+    // 复用的窗口需要重新加载页面以确保干净状态
+    let printHtml = path.join(__dirname, "../assets/print.html");
+    win.loadURL("file://" + printHtml);
+    isNew = true;
+  } else {
+    // 3. 无空闲窗口可复用，直接创建新窗口
+    win = createPrinterWindow();
+    isNew = true;
+  }
 
   win.on("closed", () => {
     pq.window = null;
   });
 
   pq.window = win;
-  return { window: win, isNew: true };
+  return { window: win, isNew: isNew };
 }
 
 /**
@@ -223,6 +304,33 @@ function onTaskDone(printerName, taskId, socketId, templateId, success, reason) 
 
   pq.isPrinting = false;
   pq.currentTask = null; // 清除当前任务引用
+
+  // 打印完成且队列已空，超过保留数量时延时回收空闲窗口
+  if (pq.queue.length === 0 && pq.window && !pq.window.isDestroyed()) {
+    // 清除可能存在的旧定时器
+    if (pq.idleTimer) {
+      clearTimeout(pq.idleTimer);
+    }
+    const winToClose = pq.window;
+    pq.idleTimer = setTimeout(() => {
+      try {
+        // 回收前再次检查：活跃窗口数必须大于保留数量才回收
+        if (countActiveWindows() > MIN_KEEP_WINDOWS) {
+          if (!winToClose.isDestroyed()) {
+            winToClose.destroy();
+            console.log(`[printWindow] 空闲回收窗口 printer=${printerName} 活跃窗口数=${countActiveWindows()}`);
+          }
+          pq.window = null;
+        } else {
+          console.log(`[printWindow] 活跃窗口数=${countActiveWindows()} 未超过保留数量(${MIN_KEEP_WINDOWS})，跳过回收`);
+        }
+      } catch (err) {
+        logError("printWindow-recycle", err);
+      }
+      pq.idleTimer = null;
+    }, IDLE_WINDOW_TIMEOUT);
+  }
+
   safeSendToMain("printTask", getTotalPendingCount());
   processNextTask(printerName);
 }
