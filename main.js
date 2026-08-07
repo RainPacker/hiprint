@@ -5,7 +5,7 @@ const os = require("os");
 const { execSync } = require("child_process");
 const server = require("http").createServer();
 const helper = require("./src/helper");
-const { logError } = helper;
+const { logError, saveConfig, getConfig } = helper;
 const printSetup = require("./src/print");
 const address = require("address");
 
@@ -97,6 +97,8 @@ function setAutoLaunch(enable) {
       args: ["--hidden"], // 启动参数，用于静默启动
     });
     global.AUTO_START = enable;
+    // 持久化用户选择，重启后读取
+    saveConfig("autoStart", enable);
     console.log(`[autoLaunch] 开机启动已${enable ? "开启" : "关闭"}`);
   } catch (err) {
     logError("setAutoLaunch", err);
@@ -128,8 +130,9 @@ async function initialize() {
   });
   // 当electron完成初始化
   app.whenReady().then(() => {
-    // 默认开启开机启动
-    setAutoLaunch(true);
+    // 读取用户上次的开机启动配置，首次启动默认开启
+    const savedAutoStart = getConfig("autoStart", true);
+    setAutoLaunch(savedAutoStart);
     // 创建浏览器窗口
     createWindow();
     app.on("activate", function() {
@@ -295,6 +298,11 @@ ipcMain.on("getAutoStartStatus", function (event) {
 // 获取进程优先级
 ipcMain.on("getProcessPriority", function (event) {
   event.sender.send("processPriority", global.PROCESS_PRIORITY || "普通");
+});
+
+// 获取应用版本号
+ipcMain.on("getAppVersion", function (event) {
+  event.sender.send("appVersion", app.getVersion());
 });
 
 

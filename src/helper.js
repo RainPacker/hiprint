@@ -76,6 +76,50 @@ function safeGetPrinters() {
 }
 
 /**
+ * 应用配置文件路径
+ */
+function getConfigFile() {
+  return path.join(app.getPath("userData"), "app-config.json");
+}
+
+/**
+ * 保存配置项（持久化到文件，重启后可读取）
+ * @param {string} key - 配置键
+ * @param {*} value - 配置值
+ */
+function saveConfig(key, value) {
+  try {
+    const configFile = getConfigFile();
+    let config = {};
+    if (fs.existsSync(configFile)) {
+      config = JSON.parse(fs.readFileSync(configFile, "utf-8"));
+    }
+    config[key] = value;
+    fs.writeFileSync(configFile, JSON.stringify(config, null, 2), "utf-8");
+  } catch (err) {
+    logError("saveConfig", err);
+  }
+}
+
+/**
+ * 读取配置项
+ * @param {string} key - 配置键
+ * @param {*} defaultValue - 默认值
+ * @returns {*} 配置值
+ */
+function getConfig(key, defaultValue) {
+  try {
+    const configFile = getConfigFile();
+    if (!fs.existsSync(configFile)) return defaultValue;
+    const config = JSON.parse(fs.readFileSync(configFile, "utf-8"));
+    return config[key] !== undefined ? config[key] : defaultValue;
+  } catch (err) {
+    logError("getConfig", err);
+    return defaultValue;
+  }
+}
+
+/**
  * 退出应用
  */
 exports.appQuit = function() {
@@ -94,3 +138,5 @@ exports.logError = logError;
 exports.isMainWindowAvailable = isMainWindowAvailable;
 exports.safeSendToMain = safeSendToMain;
 exports.safeGetPrinters = safeGetPrinters;
+exports.saveConfig = saveConfig;
+exports.getConfig = getConfig;

@@ -51,6 +51,7 @@
           <div class="message row">设备编号：<span id="deviceId"></span></div>
           <div class="message">开机启动：<span id="autoStartStatus">读取中</span></div>
           <div class="message">进程优先级：<span id="processPriority">读取中</span></div>
+          <div class="message row">版本号：<span id="appVersion">读取中</span></div>
         </div>
       </div>
     </div>
@@ -93,6 +94,11 @@
         ipc.send("getProcessPriority");
         ipc.on("processPriority", (event, priority) => {
           $("#processPriority").html(priority);
+        });
+        // 版本号
+        ipc.send("getAppVersion");
+        ipc.on("appVersion", (event, version) => {
+          $("#appVersion").html(version);
         });
         ipc.on("connection", socketActive);
         ipc.on("printTask", (event, arg) => {

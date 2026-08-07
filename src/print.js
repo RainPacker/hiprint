@@ -3,7 +3,7 @@
 const { app, BrowserWindow, ipcMain, Tray, Menu } = require("electron");
 const path = require("path");
 const helper = require("./helper");
-const { logError, safeSendToMain, safeGetPrinters, isMainWindowAvailable } = helper;
+const { logError, safeSendToMain, safeGetPrinters, isMainWindowAvailable, saveConfig } = helper;
 const address = require("address");
 const ipp = require("ipp");
 const store = require("./store");
@@ -352,6 +352,10 @@ async function initTray() {
               args: ["--hidden"],
             });
             global.AUTO_START = menuItem.checked;
+            // 持久化用户选择，重启后记住配置
+            saveConfig("autoStart", menuItem.checked);
+            // 通知页面更新显示
+            safeSendToMain("autoStartStatus", menuItem.checked);
             console.log(`[autoLaunch] 开机启动已${menuItem.checked ? "开启" : "关闭"}`);
             // 重建菜单以更新勾选状态
             APP_TRAY.setContextMenu(Menu.buildFromTemplate(buildTrayMenu()));
