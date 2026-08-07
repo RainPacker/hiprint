@@ -49,6 +49,8 @@
             打印状态：<span id="printedQueue">空闲</span>
           </div>
           <div class="message row">设备编号：<span id="deviceId"></span></div>
+          <div class="message">开机启动：<span id="autoStartStatus">读取中</span></div>
+          <div class="message">进程优先级：<span id="processPriority">读取中</span></div>
         </div>
       </div>
     </div>
@@ -81,6 +83,16 @@
         ipc.on("address", (event, arg) => {
           $("#ipAddress").html(`http://${arg.ip}:17521`);
           $("#macAddress").html(arg.mac);
+        });
+        // 开机启动状态
+        ipc.send("getAutoStartStatus");
+        ipc.on("autoStartStatus", (event, enabled) => {
+          $("#autoStartStatus").html(enabled ? "已启用" : "未启用");
+        });
+        // 进程优先级
+        ipc.send("getProcessPriority");
+        ipc.on("processPriority", (event, priority) => {
+          $("#processPriority").html(priority);
         });
         ipc.on("connection", socketActive);
         ipc.on("printTask", (event, arg) => {

@@ -3,6 +3,7 @@
 const { app, BrowserWindow, ipcMain, Tray, Menu } = require("electron");
 const path = require("path");
 const helper = require("./helper");
+const { logError, safeSendToMain, safeGetPrinters, isMainWindowAvailable } = helper;
 const address = require("address");
 const ipp = require("ipp");
 const store = require("./store");
@@ -61,9 +62,15 @@ function getTotalPendingCount() {
 /**
  * 解析实际打印机名称
  * 如果指定的打印机不存在，回退到默认打印机
+ * WinServer 启动时 Print Spooler 可能未就绪，返回空列表需安全处理
  */
 function resolvePrinterName(requestedPrinter) {
-  const printers = MAIN_WINDOW.webContents.getPrinters();
+  const printers = safeGetPrinters();
+  if (!printers || printers.length === 0) {
+    // 打印机列表为空（Spooler 未就绪），返回原始请求名，后续打印时会失败但不崩溃
+    logError("resolvePrinterName", "打印机列表为空，Print Spooler 可能未就绪");
+    return requestedPrinter || "";
+  }
   let havePrinter = false;
   let defaultPrinter = "";
   printers.forEach((element) => {
@@ -99,7 +106,7 @@ function enqueuePrintTask(data) {
     store.addTask(data);
   }
 
-  MAIN_WINDOW.webContents.send("printTask", getTotalPendingCount());
+  safeSendToMain("printTask", getTotalPendingCount());
   processNextTask(printerName);
 }
 
@@ -188,10 +195,15 @@ function onTaskDone(printerName, taskId, socketId, templateId, success, reason) 
 
   const socket = socketStore[socketId];
   if (socket) {
-    if (success) {
-      socket.emit("success", { msg: "打印成功", templateId: templateId });
-    } else {
-      socket.emit("error", { msg: reason || "打印失败", templateId: templateId });
+    try {
+      if (success) {
+        socket.emit("success", { msg: "打印成功", templateId: templateId });
+      } else {
+        socket.emit("error", { msg: reason || "打印失败", templateId: templateId });
+      }
+    } catch (err) {
+      // socket 可能已断开，emit 抛异常不能影响后续流程
+      logError("onTaskDone-socketEmit", err);
     }
   }
 
@@ -200,7 +212,7 @@ function onTaskDone(printerName, taskId, socketId, templateId, success, reason) 
 
   pq.isPrinting = false;
   pq.currentTask = null; // 清除当前任务引用
-  MAIN_WINDOW.webContents.send("printTask", getTotalPendingCount());
+  safeSendToMain("printTask", getTotalPendingCount());
   processNextTask(printerName);
 }
 
@@ -257,7 +269,7 @@ function restorePendingTasks() {
     pq.queue.push(taskData);
   });
 
-  MAIN_WINDOW.webContents.send("printTask", getTotalPendingCount());
+  safeSendToMain("printTask", getTotalPendingCount());
 
   // 触发每个有任务的打印机开始处理
   printerQueues.forEach((pq, printerName) => {
@@ -282,7 +294,7 @@ function restorePendingTasks() {
             store.removeTask(taskData.taskId);
           }, RENDER_TIMEOUT),
         });
-        MAIN_WINDOW.webContents.send("getHtml", taskData);
+        safeSendToMain("getHtml", taskData);
       });
     }, 1000);
   }
@@ -290,29 +302,31 @@ function restorePendingTasks() {
 
 /**
  * 将内存中所有未完成任务持久化
- * 应用关闭前调用
+ * 应用关闭前调用，使用批量写入避免多次 IO 导致退出超时被系统强杀
  */
 function flushPendingTasks() {
-  // 先清空文件（因为内存中的状态是最新的）
-  store.clearAll();
+  const allTasks = [];
 
-  // 重新写入所有队列中的任务
+  // 收集所有队列中的任务
   printerQueues.forEach((pq) => {
     // 正在打印的任务也要写入（下次启动会重试）
     if (pq.isPrinting && pq.currentTask) {
-      store.addTask(pq.currentTask);
+      allTasks.push(pq.currentTask);
     }
     pq.queue.forEach((data) => {
-      store.addTask(data);
+      allTasks.push(data);
     });
   });
 
   // 渲染中的任务也要写入（下次启动会重试渲染）
   renderingTasks.forEach((rendering) => {
     clearTimeout(rendering.timer);
-    store.addTask(rendering.data);
+    allTasks.push(rendering.data);
   });
   renderingTasks.clear();
+
+  // 一次性批量写入，避免多次 read-modify-write
+  store.saveAllTasks(allTasks);
 }
 
 // ========== 托盘 ==========
@@ -320,20 +334,52 @@ async function initTray() {
   let trayPath = path.join(__dirname, "../assets/icons/tray.png");
   APP_TRAY = new Tray(trayPath);
   APP_TRAY.setToolTip("hiprint");
-  let trayMenuTemplate = [
-    {
-      label: "退出",
-      click: () => {
-        flushPendingTasks(); // 退出前持久化未完成任务
-        MAIN_WINDOW.destroy();
-        APP_TRAY.destroy();
-        helper.appQuit();
+
+  // 构建托盘菜单（每次打开时动态刷新开机启动状态）
+  function buildTrayMenu() {
+    let trayMenuTemplate = [
+      {
+        label: "开机启动",
+        type: "checkbox",
+        checked: global.AUTO_START || false,
+        click: (menuItem) => {
+          // 切换开机启动状态
+          const { app } = require("electron");
+          try {
+            app.setLoginItemSettings({
+              openAtLogin: menuItem.checked,
+              openAsHidden: true,
+              args: ["--hidden"],
+            });
+            global.AUTO_START = menuItem.checked;
+            console.log(`[autoLaunch] 开机启动已${menuItem.checked ? "开启" : "关闭"}`);
+            // 重建菜单以更新勾选状态
+            APP_TRAY.setContextMenu(Menu.buildFromTemplate(buildTrayMenu()));
+          } catch (err) {
+            helper.logError("tray-autoLaunch", err);
+          }
+        },
       },
-    },
-  ];
-  const contextMenu = Menu.buildFromTemplate(trayMenuTemplate);
+      { type: "separator" },
+      {
+        label: "退出",
+        click: () => {
+          flushPendingTasks(); // 退出前持久化未完成任务
+          if (MAIN_WINDOW && !MAIN_WINDOW.isDestroyed()) {
+            MAIN_WINDOW.destroy();
+          }
+          APP_TRAY.destroy();
+          helper.appQuit();
+        },
+      },
+    ];
+    return trayMenuTemplate;
+  }
+
+  const contextMenu = Menu.buildFromTemplate(buildTrayMenu());
   APP_TRAY.setContextMenu(contextMenu);
   APP_TRAY.on("click", function() {
+    if (!MAIN_WINDOW || MAIN_WINDOW.isDestroyed()) return;
     if (MAIN_WINDOW.isMinimized()) {
       MAIN_WINDOW.restore();
     }
@@ -351,50 +397,66 @@ async function initSocketIo() {
   io.on("connection", (client) => {
     socketList = [];
     socketStore[client.id] = client;
-    client.emit("printerList", MAIN_WINDOW.webContents.getPrinters());
+    client.emit("printerList", safeGetPrinters());
     client.on("news", (data) => {
-      if (data && data.html) {
-        data.printer = data.printer;
-        data.socketId = client.id;
-        enqueuePrintTask(data);
+      try {
+        if (data && data.html) {
+          data.printer = data.printer;
+          data.socketId = client.id;
+          enqueuePrintTask(data);
+        }
+      } catch (err) {
+        logError("socket-news", err);
       }
     });
     // 从服务端非前端（先持久化再渲染，防止中间环节丢失）
     client.on("news-server", (data) => {
       try {
-        data = JSON.parse(data);
-      } catch (e) {
-        data = data;
+        try {
+          data = JSON.parse(data);
+        } catch (e) {
+          data = data;
+        }
+        data.socketId = client.id;
+
+        // 先分配 taskId 并持久化，确保任务不丢失
+        const taskId = nextTaskId();
+        data.taskId = taskId;
+        data._resolvedPrinter = data.printer;
+        // 标记为渲染中状态（还未生成 html）
+        store.addTask({ ...data, status: "rendering" });
+
+        // 记录渲染中的任务，用于超时保护
+        renderingTasks.set(taskId, {
+          data: data,
+          socketId: client.id,
+          timer: setTimeout(() => {
+            console.error(`[print] 模板渲染超时 taskId=${taskId}`);
+            renderingTasks.delete(taskId);
+            store.removeTask(taskId);
+            try {
+              const socket = socketStore[client.id];
+              if (socket) {
+                socket.emit("error", { msg: "模板渲染超时", templateId: data.templateId });
+              }
+            } catch (emitErr) {
+              logError("newsServer-timeoutEmit", emitErr);
+            }
+          }, RENDER_TIMEOUT),
+        });
+
+        safeSendToMain("getHtml", data);
+      } catch (err) {
+        logError("socket-news-server", err);
       }
-      data.socketId = client.id;
-
-      // 先分配 taskId 并持久化，确保任务不丢失
-      const taskId = nextTaskId();
-      data.taskId = taskId;
-      data._resolvedPrinter = data.printer;
-      // 标记为渲染中状态（还未生成 html）
-      store.addTask({ ...data, status: "rendering" });
-
-      // 记录渲染中的任务，用于超时保护
-      renderingTasks.set(taskId, {
-        data: data,
-        socketId: client.id,
-        timer: setTimeout(() => {
-          console.error(`[print] 模板渲染超时 taskId=${taskId}`);
-          renderingTasks.delete(taskId);
-          store.removeTask(taskId);
-          const socket = socketStore[client.id];
-          if (socket) {
-            socket.emit("error", { msg: "模板渲染超时", templateId: data.templateId });
-          }
-        }, RENDER_TIMEOUT),
-      });
-
-      MAIN_WINDOW.webContents.send("getHtml", data);
     });
     // 刷新打印机列表
     client.on("refreshPrinterList", (data) => {
-      client.emit("printerList", MAIN_WINDOW.webContents.getPrinters());
+      try {
+        client.emit("printerList", safeGetPrinters());
+      } catch (err) {
+        logError("socket-refreshPrinterList", err);
+      }
     });
     // 获取IP、IPV6、MAC地址、DNS
     client.on("address", (type, ...args) => {
@@ -495,12 +557,12 @@ async function initSocketIo() {
       Object.keys(socketStore).forEach((key) => {
         socketStore[key].connected && socketList.push(key);
       });
-      MAIN_WINDOW.webContents.send("connection", socketList);
+      safeSendToMain("connection", socketList);
     });
     Object.keys(socketStore).forEach((key) => {
       socketStore[key].connected && socketList.push(key);
     });
-    MAIN_WINDOW.webContents.send("connection", socketList);
+    safeSendToMain("connection", socketList);
   });
   server.listen(17521);
   // 端口监听错误通过事件触发，try-catch 无法捕获
@@ -516,86 +578,115 @@ async function initSocketIo() {
 // ========== 打印事件 ==========
 function initPrintEvent() {
   ipcMain.on("do", (event, data) => {
-    const printerName = data._resolvedPrinter || data.printer;
-    const pq = getPrinterQueue(printerName);
-    const win = pq.window;
+    try {
+      const printerName = data._resolvedPrinter || data.printer;
+      const pq = getPrinterQueue(printerName);
+      const win = pq.window;
 
-    if (!win || win.isDestroyed()) {
-      onTaskDone(printerName, data.taskId, data.socketId, data.templateId, false, "打印窗口异常");
-      return;
-    }
-
-    const printers = win.webContents.getPrinters();
-    let havePrinter = false;
-    let defaultPrinter = "";
-    printers.forEach((element) => {
-      if (element.name === printerName) {
-        havePrinter = true;
+      if (!win || win.isDestroyed()) {
+        onTaskDone(printerName, data.taskId, data.socketId, data.templateId, false, "打印窗口异常");
+        return;
       }
-      if (element.isDefault) {
-        defaultPrinter = element.name;
-      }
-    });
-    let deviceName = havePrinter ? printerName : defaultPrinter;
 
-    win.webContents.print(
-      {
-        silent: data.silent ?? true,
-        printBackground: data.printBackground ?? true,
-        deviceName: deviceName,
-        color: data.color ?? true,
-        margins: data.margins ?? {
-          marginType: "none",
+      const printers = win.webContents.getPrinters();
+      let havePrinter = false;
+      let defaultPrinter = "";
+      printers.forEach((element) => {
+        if (element.name === printerName) {
+          havePrinter = true;
+        }
+        if (element.isDefault) {
+          defaultPrinter = element.name;
+        }
+      });
+      let deviceName = havePrinter ? printerName : defaultPrinter;
+
+      // 检查 webContents 是否仍可用
+      if (!win.webContents || win.webContents.isDestroyed()) {
+        onTaskDone(printerName, data.taskId, data.socketId, data.templateId, false, "打印窗口已销毁");
+        return;
+      }
+
+      win.webContents.print(
+        {
+          silent: data.silent ?? true,
+          printBackground: data.printBackground ?? true,
+          deviceName: deviceName,
+          color: data.color ?? true,
+          margins: data.margins ?? {
+            marginType: "none",
+          },
+          landscape: data.landscape ?? false,
+          scaleFactor: data.scaleFactor ?? 100,
+          pagesPerSheet: data.pagesPerSheet ?? 1,
+          collate: data.collate ?? true,
+          copies: data.copies ?? 1,
+          pageRanges: data.pageRanges ?? {},
+          duplexMode: data.duplexMode,
+          dpi: data.dpi,
+          header: data.header,
+          footer: data.footer,
+          pageSize: data.pageSize,
         },
-        landscape: data.landscape ?? false,
-        scaleFactor: data.scaleFactor ?? 100,
-        pagesPerSheet: data.pagesPerSheet ?? 1,
-        collate: data.collate ?? true,
-        copies: data.copies ?? 1,
-        pageRanges: data.pageRanges ?? {},
-        duplexMode: data.duplexMode,
-        dpi: data.dpi,
-        header: data.header,
-        footer: data.footer,
-        pageSize: data.pageSize,
-      },
-      (success, failureReason) => {
-        onTaskDone(printerName, data.taskId, data.socketId, data.templateId, success, failureReason);
-      }
-    );
+        (success, failureReason) => {
+          try {
+            onTaskDone(printerName, data.taskId, data.socketId, data.templateId, success, failureReason);
+          } catch (err) {
+            logError("print-callback", err);
+          }
+        }
+      );
+    } catch (err) {
+      logError("ipcMain-do", err);
+      // 异常时也要通知任务完成，避免队列卡死
+      const printerName = data._resolvedPrinter || data.printer;
+      onTaskDone(printerName, data.taskId, data.socketId, data.templateId, false, "打印异常: " + err.message);
+    }
   });
 
   // 收到 UI 给的 html 代码（news-server 渲染完成后回调）
   ipcMain.on("htmlPrint", (event, data) => {
-    if (data && data.html) {
+    try {
+      if (data && data.html) {
+        // 清除渲染超时定时器
+        const rendering = renderingTasks.get(data.taskId);
+        if (rendering) {
+          clearTimeout(rendering.timer);
+          renderingTasks.delete(data.taskId);
+        }
+        data.printer = data.printer;
+        enqueuePrintTask(data);
+      }
+    } catch (err) {
+      logError("ipcMain-htmlPrint", err);
+    }
+  });
+
+  // 模板渲染失败回调
+  ipcMain.on("htmlPrintError", (event, data) => {
+    try {
       // 清除渲染超时定时器
       const rendering = renderingTasks.get(data.taskId);
       if (rendering) {
         clearTimeout(rendering.timer);
         renderingTasks.delete(data.taskId);
       }
-      data.printer = data.printer;
-      enqueuePrintTask(data);
-    }
-  });
-
-  // 模板渲染失败回调
-  ipcMain.on("htmlPrintError", (event, data) => {
-    // 清除渲染超时定时器
-    const rendering = renderingTasks.get(data.taskId);
-    if (rendering) {
-      clearTimeout(rendering.timer);
-      renderingTasks.delete(data.taskId);
-    }
-    // 从持久化中移除
-    store.removeTask(data.taskId);
-    // 通知客户端渲染失败
-    const socket = socketStore[data.socketId];
-    if (socket) {
-      socket.emit("error", {
-        msg: data.renderError || "模板渲染失败",
-        templateId: data.templateId,
-      });
+      // 从持久化中移除
+      store.removeTask(data.taskId);
+      // 通知客户端渲染失败
+      const socket = socketStore[data.socketId];
+      if (socket) {
+        try {
+          socket.emit("error", {
+            msg: data.renderError || "模板渲染失败",
+            templateId: data.templateId,
+          });
+        } catch (emitErr) {
+          logError("htmlPrintError-emit", emitErr);
+        }
+      }
+    } catch (err) {
+      logError("ipcMain-htmlPrintError", err);
     }
   });
 }

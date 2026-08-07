@@ -1,8 +1,10 @@
 const { app, BrowserWindow, BrowserView, ipcMain, Menu } = require("electron");
 
 const path = require("path");
+const os = require("os");
 const server = require("http").createServer();
 const helper = require("./src/helper");
+const { logError } = helper;
 const printSetup = require("./src/print");
 const address = require("address");
 
@@ -11,6 +13,21 @@ const address = require("address");
 app.commandLine.appendSwitch("disable-gpu");
 app.commandLine.appendSwitch("no-sandbox");
 app.commandLine.appendSwitch("disable-software-rasterizer");
+// WinServer 2025 兼容性：禁用可能不兼容的 GPU 相关特性
+app.commandLine.appendSwitch("disable-gpu-compositing");
+app.commandLine.appendSwitch("disable-gpu-sandbox");
+// 提升响应优先级：禁用后台节流，提升打印任务处理速度
+app.commandLine.appendSwitch("disable-background-timer-throttling");
+app.commandLine.appendSwitch("disable-renderer-backgrounding");
+app.commandLine.appendSwitch("disable-backgrounding-occluded-windows");
+
+// 设置进程为高优先级，确保打印任务及时响应
+// Windows 优先级：32=Normal, 128=High, 256=Realtime(需管理员)
+try {
+  os.setPriority(process.pid, "high");
+} catch (err) {
+  logError("setPriority", err);
+}
 
 // 主进程
 global.MAIN_WINDOW = null;
@@ -44,13 +61,49 @@ global.io = io;
 
 global.socketStore = {};
 
-// 全局异常捕获，防止未处理异常导致闪退
+// 全局异常捕获，防止未处理异常导致闪退，并写入崩溃日志
 process.on("uncaughtException", (error) => {
-  console.error("[uncaughtException]", error);
+  logError("uncaughtException", error);
 });
 process.on("unhandledRejection", (reason, promise) => {
-  console.error("[unhandledRejection]", reason);
+  logError("unhandledRejection", reason);
 });
+
+// ========== 开机启动 ==========
+// 全局开关状态，供托盘菜单读取/切换
+global.AUTO_START = false;
+
+/**
+ * 配置开机启动
+ * @param {boolean} enable - 是否启用
+ */
+function setAutoLaunch(enable) {
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: enable,
+      openAsHidden: true, // 开机启动后隐藏到托盘
+      args: ["--hidden"], // 启动参数，用于静默启动
+    });
+    global.AUTO_START = enable;
+    console.log(`[autoLaunch] 开机启动已${enable ? "开启" : "关闭"}`);
+  } catch (err) {
+    logError("setAutoLaunch", err);
+  }
+}
+
+/**
+ * 读取当前开机启动状态
+ */
+function getAutoLaunch() {
+  try {
+    const settings = app.getLoginItemSettings();
+    global.AUTO_START = settings.openAtLogin;
+    return settings.openAtLogin;
+  } catch (err) {
+    logError("getAutoLaunch", err);
+    return false;
+  }
+}
 
 // 初始化
 async function initialize() {
@@ -69,6 +122,8 @@ async function initialize() {
   });
   // 当electron完成初始化
   app.whenReady().then(() => {
+    // 读取当前开机启动状态
+    getAutoLaunch();
     // 创建浏览器窗口
     createWindow();
     app.on("activate", function() {
@@ -120,6 +175,14 @@ async function createWindow() {
   }
 
   MAIN_WINDOW = new BrowserWindow(windowOptions);
+
+  // 开机启动时带 --hidden 参数，静默启动到托盘
+  const startHidden = process.argv.includes("--hidden");
+  if (startHidden) {
+    MAIN_WINDOW.hide();
+    MAIN_WINDOW.setSkipTaskbar(true);
+  }
+
   // 白屏的问题
   await loadingView(windowOptions);
   // MAIN_WINDOW.once("ready-to-show", () => {
@@ -135,6 +198,25 @@ async function createWindow() {
   if (process.env.NODE_ENV !== "production") {
     MAIN_WINDOW.webContents.openDevTools();
   }
+
+  // 渲染进程崩溃处理（WinServer 2025 上 GPU 兼容性可能导致崩溃）
+  MAIN_WINDOW.webContents.on("render-process-gone", (event, details) => {
+    logError("render-process-gone", `reason=${details.reason} exitCode=${details.exitCode}`);
+    // 尝试重新加载页面恢复
+    try {
+      if (!MAIN_WINDOW.isDestroyed()) {
+        MAIN_WINDOW.webContents.reload();
+      }
+    } catch (err) {
+      logError("render-process-gone-reload", err);
+    }
+  });
+
+  // GPU 进程崩溃处理
+  app.on("gpu-process-crashed", (event) => {
+    logError("gpu-process-crashed", "GPU 进程崩溃");
+  });
+
   // 退出
   MAIN_WINDOW.on("closed", () => {
     MAIN_WINDOW = null;
@@ -142,7 +224,7 @@ async function createWindow() {
   });
   // 点击关闭，最小化到托盘
   MAIN_WINDOW.on("close", (event) => {
-    if (!CAN_QUIT) {
+    if (!CAN_QUIT && MAIN_WINDOW && !MAIN_WINDOW.isDestroyed()) {
       MAIN_WINDOW.hide();
       MAIN_WINDOW.setSkipTaskbar(true); // 隐藏任务栏
       event.preventDefault();
@@ -197,6 +279,32 @@ ipcMain.on("getAddress", function(event) {
   address(function(err, arg) {
     event.sender.send("address", arg);
   });
+});
+
+// 获取开机启动状态
+ipcMain.on("getAutoStartStatus", function (event) {
+  event.sender.send("autoStartStatus", getAutoLaunch());
+});
+
+// 获取进程优先级
+ipcMain.on("getProcessPriority", function (event) {
+  let priorityLabel = "普通";
+  try {
+    const priority = os.getPriority(process.pid);
+    // Windows: 32=Normal, 128=High, 256=Realtime
+    if (priority >= 128 && priority < 256) {
+      priorityLabel = "高";
+    } else if (priority >= 256) {
+      priorityLabel = "实时";
+    } else if (priority >= 32 && priority < 128) {
+      priorityLabel = "普通";
+    } else {
+      priorityLabel = "低";
+    }
+  } catch (err) {
+    logError("getProcessPriority", err);
+  }
+  event.sender.send("processPriority", priorityLabel);
 });
 
 

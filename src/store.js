@@ -52,7 +52,7 @@ function saveTasks(tasks) {
 }
 
 /**
- * 添加一个任务到持久化存储
+ * 保存一个任务到持久化存储（增量追加，退出时请用 saveAllTasks 批量写入）
  * @param {Object} data - 任务数据
  */
 function addTask(data) {
@@ -63,6 +63,7 @@ function addTask(data) {
     printer: data.printer,
     _resolvedPrinter: data._resolvedPrinter,
     html: data.html,
+    template: data.template,
     templateId: data.templateId,
     title: data.title,
     socketId: data.socketId,
@@ -86,6 +87,46 @@ function addTask(data) {
   };
   tasks.push(storeData);
   saveTasks(tasks);
+}
+
+/**
+ * 批量保存所有任务（一次性写入，退出时使用，避免多次 IO）
+ * @param {Array} tasksData - 任务数据数组
+ */
+function saveAllTasks(tasksData) {
+  try {
+    ensureDir();
+    const storeList = tasksData.map((data) => ({
+      taskId: data.taskId,
+      printer: data.printer,
+      _resolvedPrinter: data._resolvedPrinter,
+      html: data.html,
+      template: data.template,
+      templateId: data.templateId,
+      title: data.title,
+      socketId: data.socketId,
+      silent: data.silent,
+      printBackground: data.printBackground,
+      color: data.color,
+      margins: data.margins,
+      landscape: data.landscape,
+      scaleFactor: data.scaleFactor,
+      pagesPerSheet: data.pagesPerSheet,
+      collate: data.collate,
+      copies: data.copies,
+      pageRanges: data.pageRanges,
+      duplexMode: data.duplexMode,
+      dpi: data.dpi,
+      header: data.header,
+      footer: data.footer,
+      pageSize: data.pageSize,
+      status: "pending",
+      createdAt: Date.now(),
+    }));
+    fs.writeFileSync(STORE_FILE, JSON.stringify(storeList, null, 2), "utf-8");
+  } catch (err) {
+    console.error("[store] 批量保存任务失败:", err.message);
+  }
 }
 
 /**
@@ -141,6 +182,7 @@ function getPendingCount() {
 
 module.exports = {
   addTask,
+  saveAllTasks,
   markPrinting,
   removeTask,
   getPendingTasks,
