@@ -3,7 +3,7 @@ const { app, BrowserWindow, BrowserView, ipcMain, Menu } = require("electron");
 const path = require("path");
 const server = require("http").createServer();
 const helper = require("./src/helper");
-const { logError, saveConfig, getConfig, setProcessHighPriority, setAllProcessesHighPriority } = helper;
+const { logError, flushLogs, saveConfig, getConfig, setProcessHighPriority, setAllProcessesHighPriority } = helper;
 const printSetup = require("./src/print");
 const address = require("address");
 
@@ -35,7 +35,8 @@ global.server = server;
 const io = require("socket.io")(server, {
   pingInterval: 10000,
   pingTimeout: 5000,
-  maxHttpBufferSize: 10000000000,
+  // 限制为 500MB，防止大 payload 导致内存溢出闪退
+  maxHttpBufferSize: 5e8,
   allowEIO3: true, // 兼容 Socket.IO 2.x
   // 跨域问题(Socket.IO 3.x 使用这种方式)
   cors: {
@@ -56,11 +57,14 @@ global.io = io;
 global.socketStore = {};
 
 // 全局异常捕获，防止未处理异常导致闪退，并写入崩溃日志
+// 异常可能预示主进程即将退出，立即刷盘确保日志不丢失
 process.on("uncaughtException", (error) => {
   logError("uncaughtException", error);
+  flushLogs();
 });
 process.on("unhandledRejection", (reason, promise) => {
   logError("unhandledRejection", reason);
+  flushLogs();
 });
 
 // ========== 开机启动 ==========
@@ -115,15 +119,17 @@ async function initialize() {
     // 读取用户上次的开机启动配置，首次启动默认开启
     const savedAutoStart = getConfig("autoStart", true);
     setAutoLaunch(savedAutoStart);
-    // 批量设置所有同名进程（Main/Renderer/GPU/Network/Utility）为高优先级
-    // 此时 Chromium 各子进程已创建，按进程名一次性覆盖
-    global.PROCESS_PRIORITY = setAllProcessesHighPriority();
     // 创建浏览器窗口
     createWindow();
     app.on("activate", function() {
       if (BrowserWindow.getAllWindows().length === 0) {
         createWindow();
       }
+    });
+
+    // 监听所有子进程崩溃（GPU/Renderer/Utility/Network 等）
+    app.on("child-process-gone", (event, details) => {
+      logError("child-process-gone", `type=${details.type} reason=${details.reason} exitCode=${details.exitCode}`);
     });
   });
   // 关闭了所有窗口
@@ -188,6 +194,17 @@ async function createWindow() {
   // 加载主页面（打包后需处理 asar 路径）
   let indexPath = path.join(__dirname, "/assets/index.html");
   MAIN_WINDOW.webContents.loadURL("file://" + indexPath);
+
+  // 主窗口 dom-ready 后批量设置所有进程优先级
+  // 此时 Main/Renderer/GPU/Network/Utility 进程均已创建
+  MAIN_WINDOW.webContents.once("dom-ready", () => {
+    global.PROCESS_PRIORITY = setAllProcessesHighPriority();
+    // 3秒后再次设置，覆盖可能延迟创建的子进程
+    setTimeout(() => {
+      global.PROCESS_PRIORITY = setAllProcessesHighPriority();
+    }, 3000);
+  });
+
   // 仅在开发环境打开 DevTools，生产环境打开可能导致 WinServer 渲染异常
   if (process.env.NODE_ENV !== "production") {
     MAIN_WINDOW.webContents.openDevTools();
@@ -214,7 +231,14 @@ async function createWindow() {
   // 退出
   MAIN_WINDOW.on("closed", () => {
     MAIN_WINDOW = null;
-    server.close();
+    // 仅在真正退出时关闭 server，避免托盘模式下重复调用
+    try {
+      if (global.server && global.server.listening) {
+        global.server.close();
+      }
+    } catch (err) {
+      logError("server-close", err);
+    }
   });
   // 点击关闭，最小化到托盘
   MAIN_WINDOW.on("close", (event) => {
@@ -244,8 +268,15 @@ async function loadingView(windowOptions) {
   const loadingHtml = path.join(__dirname, "/assets/loading.html");
   loadingBrowserView.webContents.loadURL("file://" + loadingHtml);
 
-  MAIN_WINDOW.webContents.on("dom-ready", async (event) => {
-    MAIN_WINDOW.removeBrowserView(loadingBrowserView);
+  // 使用 once 避免重复触发，添加销毁检查
+  MAIN_WINDOW.webContents.once("dom-ready", async (event) => {
+    try {
+      if (!MAIN_WINDOW.isDestroyed()) {
+        MAIN_WINDOW.removeBrowserView(loadingBrowserView);
+      }
+    } catch (err) {
+      logError("loadingView-remove", err);
+    }
   });
 }
 

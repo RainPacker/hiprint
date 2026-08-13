@@ -3,7 +3,7 @@
 const { app, BrowserWindow, ipcMain, Tray, Menu } = require("electron");
 const path = require("path");
 const helper = require("./helper");
-const { logError, safeSendToMain, safeGetPrinters, isMainWindowAvailable, saveConfig, setProcessHighPriority } = helper;
+const { logError, logInfo, flushLogs, safeSendToMain, safeGetPrinters, isMainWindowAvailable, saveConfig, setProcessHighPriority } = helper;
 const address = require("address");
 const ipp = require("ipp");
 const store = require("./store");
@@ -26,10 +26,15 @@ const RENDER_TIMEOUT = 15000;
 // 空闲窗口回收延时（毫秒），打印完成后空闲此时间则自动销毁
 const IDLE_WINDOW_TIMEOUT = 60000;
 // 最少保留的窗口数，空闲回收时不低于此数量
-const MIN_KEEP_WINDOWS = 10;
+const MIN_KEEP_WINDOWS = 5;
+// 单个窗口最大复用次数，超过后强制销毁重建，避免渲染进程内存累积导致硬崩溃
+// 渲染进程长期不重启会累积 hiprint 状态/内存碎片，最终可能在 IPC send 时引发底层崩溃
+const MAX_WINDOW_REUSE = 50;
 
 // 打印机队列映射表
-// key: 打印机名称, value: { queue: [], isPrinting: boolean, window: BrowserWindow|null, timer: NodeJS.Timeout|null, idleTimer: NodeJS.Timeout|null }
+// key: 打印机名称, value: { queue, isPrinting, currentTask, window, timer, idleTimer, reuseCount, renderGone }
+//   reuseCount: 该窗口已被复用打印的次数，达到 MAX_WINDOW_REUSE 后强制销毁重建
+//   renderGone: 渲染进程崩溃标志，true 时该窗口不可用，必须重建
 const printerQueues = new Map();
 
 // 渲染中的任务映射表（news-server 专用）
@@ -48,6 +53,8 @@ function getPrinterQueue(printerName) {
       window: null,
       timer: null,
       idleTimer: null, // 空闲窗口自动回收定时器
+      reuseCount: 0,   // 当前窗口已复用打印次数
+      renderGone: false, // 渲染进程是否已崩溃
     });
   }
   return printerQueues.get(printerName);
@@ -103,6 +110,8 @@ function enqueuePrintTask(data) {
   data.printer = printerName;
   data._resolvedPrinter = printerName;
 
+  logInfo("enqueuePrintTask", `taskId=${data.taskId} printer="${printerName}" templateId=${data.templateId || "N/A"} htmlLen=${data.html ? data.html.length : 0}`);
+
   const pq = getPrinterQueue(printerName);
   pq.queue.push(data);
 
@@ -128,20 +137,49 @@ function processNextTask(printerName) {
   const data = pq.queue.shift();
   pq.currentTask = data; // 记录当前正在打印的任务
 
+  logInfo("processNextTask", `taskId=${data.taskId} printer="${printerName}" 队列剩余=${pq.queue.length}`);
+
   // 持久化：标记为打印中
   store.markPrinting(data.taskId);
 
   // 超时保护
   pq.timer = setTimeout(() => {
-    console.error(`[print] 任务超时 taskId=${data.taskId} printer=${printerName}`);
+    logError("print-timeout", `taskId=${data.taskId} printer="${printerName}" 超时(${TASK_TIMEOUT}ms)`);
     onTaskDone(printerName, data.taskId, data.socketId, data.templateId, false, "打印超时");
   }, TASK_TIMEOUT);
 
   // 确保窗口已创建并等待加载完成
   const { window: win, isNew } = ensurePrinterWindow(printerName);
 
+  logInfo("processNextTask-window", `taskId=${data.taskId} windowReady=${!isNew} isNew=${isNew} reuseCount=${pq.reuseCount}`);
+
   const sendPrintNew = () => {
-    win.webContents.send("print-new", data);
+    try {
+      // 检查窗口和 webContents 是否仍然可用
+      if (win.isDestroyed() || !win.webContents || win.webContents.isDestroyed()) {
+        logError("processNextTask-send", `taskId=${data.taskId} 窗口已销毁，任务标记为失败`);
+        onTaskDone(printerName, data.taskId, data.socketId, data.templateId, false, "打印窗口已销毁");
+        return;
+      }
+      // 如果渲染进程已被标记崩溃（事件可能在 ensurePrinterWindow 之后触发），跳过发送并重建
+      if (pq.renderGone) {
+        logError("processNextTask-send", `taskId=${data.taskId} 渲染进程已崩溃，标记任务失败并重建窗口`);
+        onTaskDone(printerName, data.taskId, data.socketId, data.templateId, false, "渲染进程已崩溃");
+        return;
+      }
+      // 发送 print-new 是硬崩溃高发点（渲染进程可能已死但 isDestroyed 仍返回 false）
+      // 提前刷盘确保崩溃前最后一条日志落地
+      logInfo("processNextTask-send", `taskId=${data.taskId} 即将调用 webContents.send print-new`);
+      flushLogs();
+      win.webContents.send("print-new", data);
+      // 发送成功后递增复用计数（用于触发定期重建）
+      pq.reuseCount++;
+      logInfo("processNextTask-send", `taskId=${data.taskId} 已发送 print-new reuseCount=${pq.reuseCount}`);
+    } catch (err) {
+      logError("processNextTask-send", `taskId=${data.taskId} ${err.message}`);
+      // 发送失败，标记任务失败并继续下一个，避免队列卡死
+      onTaskDone(printerName, data.taskId, data.socketId, data.templateId, false, "发送打印数据失败: " + err.message);
+    }
   };
 
   if (isNew) {
@@ -178,7 +216,8 @@ function findAndDetachIdleWindow() {
       pq.window &&
       !pq.window.isDestroyed() &&
       !pq.isPrinting &&
-      pq.queue.length === 0
+      pq.queue.length === 0 &&
+      !pq.renderGone // 跳过渲染进程已崩溃的窗口
     ) {
       idleEntry = pq;
       idleKey = key;
@@ -193,7 +232,7 @@ function findAndDetachIdleWindow() {
       idleEntry.idleTimer = null;
     }
     idleEntry.window = null;
-    console.log(`[printWindow] 复用空闲窗口，从打印机 "${idleKey}" 剥离`);
+    logInfo("findAndDetachIdleWindow", `从打印机 "${idleKey}" 剥离空闲窗口`);
     return win;
   }
   return null;
@@ -216,18 +255,53 @@ function createPrinterWindow() {
 
   const win = new BrowserWindow(windowOptions);
 
-  // 设置打印窗口渲染进程（子进程）为高优先级
-  // 渲染进程在 dom-ready 时才真正创建，此时 getProcessId() 才返回真实 PID
-  win.webContents.once("dom-ready", () => {
-    try {
-      const rendererPid = win.webContents.getProcessId();
-      if (rendererPid > 0) {
-        setProcessHighPriority(rendererPid);
+  // 渲染进程崩溃自动恢复
+  win.webContents.on("render-process-gone", (event, details) => {
+    logError("printWindow-render-gone", `reason=${details.reason} exitCode=${details.exitCode}`);
+    // 找到该窗口对应的队列，标记崩溃并重置状态
+    for (const [name, pq] of printerQueues) {
+      if (pq.window === win) {
+        logInfo("printWindow-render-gone", `printer="${name}" 渲染进程崩溃，重置队列 reuseCount=${pq.reuseCount}`);
+        // 标记渲染进程已崩溃，后续 ensurePrinterWindow 会强制重建窗口
+        pq.renderGone = true;
+        if (pq.timer) {
+          clearTimeout(pq.timer);
+          pq.timer = null;
+        }
+        pq.isPrinting = false;
+        pq.currentTask = null;
+        pq.window = null;
+        // 销毁崩溃的窗口（可能已销毁，需 try-catch）
+        try { win.destroy(); } catch (e) {}
+        // 延迟 1 秒后重新处理队列，避免崩溃循环
+        setTimeout(() => {
+          logInfo("printWindow-render-gone", `printer="${name}" 重新处理队列，剩余=${pq.queue.length}`);
+          processNextTask(name);
+        }, 1000);
+        break;
       }
+    }
+  });
+
+  // 渲染进程无响应（可能预示即将崩溃，标记并跳过该窗口的复用）
+  win.webContents.on("unresponsive", () => {
+    logError("printWindow-unresponsive", "渲染进程无响应，标记窗口不可复用");
+    for (const [name, pq] of printerQueues) {
+      if (pq.window === win) {
+        pq.renderGone = true;
+        break;
+      }
+    }
+  });
+
+  // 新窗口创建后延迟批量设置所有同名进程优先级
+  setTimeout(() => {
+    try {
+      helper.setAllProcessesHighPriority();
     } catch (err) {
       logError("printWindow-priority", err);
     }
-  });
+  }, 1000);
 
   let printHtml = path.join(__dirname, "../assets/print.html");
   win.loadURL("file://" + printHtml);
@@ -242,14 +316,29 @@ function createPrinterWindow() {
 function ensurePrinterWindow(printerName) {
   const pq = getPrinterQueue(printerName);
 
-  // 1. 当前队列已有可用窗口，直接复用
+  // 1. 当前队列已有窗口，但需检查是否可继续复用
   if (pq.window && !pq.window.isDestroyed()) {
-    // 取消空闲回收定时器（窗口即将被使用）
-    if (pq.idleTimer) {
-      clearTimeout(pq.idleTimer);
-      pq.idleTimer = null;
+    // 渲染进程已崩溃或无响应，必须销毁重建，否则 IPC send 可能引发主进程硬崩溃
+    if (pq.renderGone) {
+      logInfo("ensurePrinterWindow", `printer="${printerName}" 渲染进程已崩溃，销毁旧窗口重建 reuseCount=${pq.reuseCount}`);
+      try { pq.window.destroy(); } catch (e) {}
+      pq.window = null;
+      pq.renderGone = false;
+    } else if (pq.reuseCount >= MAX_WINDOW_REUSE) {
+      // 复用次数达上限，主动销毁重建，避免渲染进程内存累积导致硬崩溃
+      logInfo("ensurePrinterWindow", `printer="${printerName}" 复用次数达上限(${MAX_WINDOW_REUSE})，销毁旧窗口重建`);
+      try { pq.window.destroy(); } catch (e) {}
+      pq.window = null;
+      pq.reuseCount = 0;
+    } else {
+      // 窗口健康，直接复用
+      if (pq.idleTimer) {
+        clearTimeout(pq.idleTimer);
+        pq.idleTimer = null;
+      }
+      logInfo("ensurePrinterWindow", `printer="${printerName}" 复用已有窗口 reuseCount=${pq.reuseCount}`);
+      return { window: pq.window, isNew: false };
     }
-    return { window: pq.window, isNew: false };
   }
 
   let win = null;
@@ -258,17 +347,25 @@ function ensurePrinterWindow(printerName) {
   // 2. 优先复用其他队列的空闲窗口
   win = findAndDetachIdleWindow();
   if (win) {
+    logInfo("ensurePrinterWindow", `printer="${printerName}" 复用空闲窗口 活跃窗口数=${countActiveWindows() + 1}`);
     // 复用的窗口需要重新加载页面以确保干净状态
     let printHtml = path.join(__dirname, "../assets/print.html");
     win.loadURL("file://" + printHtml);
     isNew = true;
+    // 复用他人窗口时重置计数
+    pq.reuseCount = 0;
+    pq.renderGone = false;
   } else {
     // 3. 无空闲窗口可复用，直接创建新窗口
+    logInfo("ensurePrinterWindow", `printer="${printerName}" 创建新窗口 活跃窗口数=${countActiveWindows() + 1}`);
     win = createPrinterWindow();
     isNew = true;
+    pq.reuseCount = 0;
+    pq.renderGone = false;
   }
 
   win.on("closed", () => {
+    logInfo("ensurePrinterWindow-closed", `printer="${printerName}" 窗口已关闭`);
     pq.window = null;
   });
 
@@ -281,6 +378,8 @@ function ensurePrinterWindow(printerName) {
  */
 function onTaskDone(printerName, taskId, socketId, templateId, success, reason) {
   const pq = getPrinterQueue(printerName);
+
+  logInfo("onTaskDone", `taskId=${taskId} printer="${printerName}" success=${success} reason="${reason || ""}"`);
 
   // 清除超时定时器
   if (pq.timer) {
@@ -366,21 +465,26 @@ function restorePendingTasks() {
   const needRender = [];
 
   pendingTasks.forEach((taskData) => {
-    const printerName = taskData._resolvedPrinter || taskData.printer;
-    if (!printerName) {
-      store.removeTask(taskData.taskId);
-      return;
-    }
+    try {
+      const printerName = taskData._resolvedPrinter || taskData.printer;
+      if (!printerName) {
+        store.removeTask(taskData.taskId);
+        return;
+      }
 
-    if (taskData.html) {
-      // 已有 html，直接入打印队列
-      printReady.push(taskData);
-    } else if (taskData.template) {
-      // 只有 template 没有 html，需要重新渲染（news-server 任务）
-      needRender.push(taskData);
-    } else {
-      // 既没有 html 也没有 template，无法处理，移除
-      store.removeTask(taskData.taskId);
+      if (taskData.html) {
+        // 已有 html，直接入打印队列
+        printReady.push(taskData);
+      } else if (taskData.template) {
+        // 只有 template 没有 html，需要重新渲染（news-server 任务）
+        needRender.push(taskData);
+      } else {
+        // 既没有 html 也没有 template，无法处理，移除
+        store.removeTask(taskData.taskId);
+      }
+    } catch (err) {
+      logError("restorePendingTasks-item", err);
+    // 单个任务异常不影响其他任务恢复
     }
   });
 
@@ -394,31 +498,50 @@ function restorePendingTasks() {
   safeSendToMain("printTask", getTotalPendingCount());
 
   // 触发每个有任务的打印机开始处理
+  // 启动时多个打印机并发处理可能同时创建多个窗口，对低内存机器冲击大
+  // 改为按打印机串行启动：每个打印机间隔 200ms，给系统喘息时间
+  const printersToStart = [];
   printerQueues.forEach((pq, printerName) => {
     if (pq.queue.length > 0) {
-      processNextTask(printerName);
+      printersToStart.push(printerName);
     }
+  });
+
+  logInfo("restorePendingTasks-start", `待启动打印机数=${printersToStart.length} 待渲染任务=${needRender.length}`);
+
+  printersToStart.forEach((name, idx) => {
+    setTimeout(() => {
+      try {
+        processNextTask(name);
+      } catch (err) {
+        logError("restorePendingTasks-processNext", `printer="${name}" ${err.message}`);
+      }
+    }, idx * 200);
   });
 
   // 需要重新渲染的任务，延迟发送 getHtml（等 MAIN_WINDOW 加载完成）
   if (needRender.length > 0) {
-    console.log(`[store] ${needRender.length} 个任务需要重新渲染模板`);
-    // 延迟 1 秒确保 MAIN_WINDOW 已加载 hiprint
+    logInfo("restorePendingTasks-render", `${needRender.length} 个任务需要重新渲染模板`);
+    // 延迟 1.5 秒确保 MAIN_WINDOW 已加载 hiprint（启动恢复时主窗口可能仍在加载）
     setTimeout(() => {
       needRender.forEach((taskData) => {
-        // 重新设置渲染超时保护
-        renderingTasks.set(taskData.taskId, {
-          data: taskData,
-          socketId: taskData.socketId,
-          timer: setTimeout(() => {
-            console.error(`[print] 恢复任务渲染超时 taskId=${taskData.taskId}`);
-            renderingTasks.delete(taskData.taskId);
-            store.removeTask(taskData.taskId);
-          }, RENDER_TIMEOUT),
-        });
-        safeSendToMain("getHtml", taskData);
+        try {
+          // 重新设置渲染超时保护
+          renderingTasks.set(taskData.taskId, {
+            data: taskData,
+            socketId: taskData.socketId,
+            timer: setTimeout(() => {
+              logError("restorePendingTasks-render-timeout", `taskId=${taskData.taskId} 渲染超时`);
+              renderingTasks.delete(taskData.taskId);
+              store.removeTask(taskData.taskId);
+            }, RENDER_TIMEOUT),
+          });
+          safeSendToMain("getHtml", taskData);
+        } catch (err) {
+          logError("restorePendingTasks-render-item", `taskId=${taskData.taskId} ${err.message}`);
+        }
       });
-    }, 1000);
+    }, 1500);
   }
 }
 
@@ -449,6 +572,10 @@ function flushPendingTasks() {
 
   // 一次性批量写入，避免多次 read-modify-write
   store.saveAllTasks(allTasks);
+  // 确保防抖的写入立即落地
+  if (store.flushSave) {
+    store.flushSave();
+  }
 }
 
 // ========== 托盘 ==========
@@ -644,17 +771,26 @@ async function initSocketIo() {
           }
         }
         printer.execute(action, msg, (err, res) => {
-          client.emit(
-            "ippPrinterCallback",
-            err ? { type: err.name, msg: err.message } : null,
-            res
-          );
+          try {
+            client.emit(
+              "ippPrinterCallback",
+              err ? { type: err.name, msg: err.message } : null,
+              res
+            );
+          } catch (emitErr) {
+            logError("ippPrint-callback-emit", emitErr);
+          }
         });
       } catch (err) {
-        client.emit("ippPrinterCallback", {
-          type: err.name,
-          msg: err.message,
-        });
+        try {
+          client.emit("ippPrinterCallback", {
+            type: err.name || "Error",
+            msg: err.message || "IPP打印异常",
+          });
+        } catch (emitErr) {
+          logError("ippPrint-emit", emitErr);
+        }
+        logError("ippPrint", err);
       }
     });
     // ipp request
@@ -663,17 +799,26 @@ async function initSocketIo() {
         const { url, data } = options;
         let _data = ipp.serialize(data);
         ipp.request(url, _data, function(err, res) {
-          client.emit(
-            "ippRequestCallback",
-            err ? { type: err.name, msg: err.message } : null,
-            res
-          );
+          try {
+            client.emit(
+              "ippRequestCallback",
+              err ? { type: err.name, msg: err.message } : null,
+              res
+            );
+          } catch (emitErr) {
+            logError("ippRequest-callback-emit", emitErr);
+          }
         });
       } catch (err) {
-        client.emit("ippRequestCallback", {
-          type: err.name,
-          msg: err.message,
-        });
+        try {
+          client.emit("ippRequestCallback", {
+            type: err.name || "Error",
+            msg: err.message || "IPP请求异常",
+          });
+        } catch (emitErr) {
+          logError("ippRequest-emit", emitErr);
+        }
+        logError("ippRequest", err);
       }
     });
     // 断开连接
