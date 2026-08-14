@@ -650,13 +650,17 @@ async function initSocketIo() {
   io.on("connection", (client) => {
     socketList = [];
     socketStore[client.id] = client;
+    logInfo("socket-connection", `client.id=${client.id} 当前连接数=${Object.keys(socketStore).length}`);
     client.emit("printerList", safeGetPrinters());
     client.on("news", (data) => {
       try {
+        logInfo("socket-news-recv", `client.id=${client.id} printer="${data && data.printer}" templateId=${data && data.templateId} htmlLen=${data && data.html ? data.html.length : 0}`);
         if (data && data.html) {
           data.printer = data.printer;
           data.socketId = client.id;
           enqueuePrintTask(data);
+        } else {
+          logError("socket-news-invalid", `client.id=${client.id} 数据缺少 html 字段`);
         }
       } catch (err) {
         logError("socket-news", err);
@@ -671,6 +675,7 @@ async function initSocketIo() {
           data = data;
         }
         data.socketId = client.id;
+        logInfo("socket-news-server-recv", `client.id=${client.id} printer="${data.printer}" templateId=${data.templateId} templateLen=${data.template ? JSON.stringify(data.template).length : 0}`);
 
         // 先分配 taskId 并持久化，确保任务不丢失
         const taskId = nextTaskId();
@@ -684,7 +689,7 @@ async function initSocketIo() {
           data: data,
           socketId: client.id,
           timer: setTimeout(() => {
-            console.error(`[print] 模板渲染超时 taskId=${taskId}`);
+            logError("newsServer-render-timeout", `taskId=${taskId} 模板渲染超时`);
             renderingTasks.delete(taskId);
             store.removeTask(taskId);
             try {
@@ -706,6 +711,7 @@ async function initSocketIo() {
     // 刷新打印机列表
     client.on("refreshPrinterList", (data) => {
       try {
+        logInfo("socket-refreshPrinterList-recv", `client.id=${client.id}`);
         client.emit("printerList", safeGetPrinters());
       } catch (err) {
         logError("socket-refreshPrinterList", err);
@@ -713,6 +719,7 @@ async function initSocketIo() {
     });
     // 获取IP、IPV6、MAC地址、DNS
     client.on("address", (type, ...args) => {
+      logInfo("socket-address-recv", `client.id=${client.id} type=${type}`);
       switch (type) {
         case "ip":
           client.emit("address", type, address.ip());
@@ -753,6 +760,7 @@ async function initSocketIo() {
     client.on("ippPrint", (options) => {
       try {
         const { url, opt, action, message } = options;
+        logInfo("socket-ippPrint-recv", `client.id=${client.id} action=${action} url=${url}`);
         let printer = ipp.Printer(url, opt);
         client.emit("ippPrinterConnected", printer);
         let msg = Object.assign(
@@ -797,6 +805,7 @@ async function initSocketIo() {
     client.on("ippRequest", (options) => {
       try {
         const { url, data } = options;
+        logInfo("socket-ippRequest-recv", `client.id=${client.id} url=${url} dataLen=${data ? data.length : 0}`);
         let _data = ipp.serialize(data);
         ipp.request(url, _data, function(err, res) {
           try {
@@ -822,7 +831,8 @@ async function initSocketIo() {
       }
     });
     // 断开连接
-    client.on("disconnect", () => {
+    client.on("disconnect", (reason) => {
+      logInfo("socket-disconnect", `client.id=${client.id} reason=${reason} 剩余连接数=${Object.keys(socketStore).length - 1}`);
       delete socketStore[client.id];
       socketList = [];
       Object.keys(socketStore).forEach((key) => {
@@ -851,6 +861,7 @@ function initPrintEvent() {
   ipcMain.on("do", (event, data) => {
     try {
       const printerName = data._resolvedPrinter || data.printer;
+      logInfo("ipc-do-recv", `taskId=${data.taskId} printer="${printerName}" copies=${data.copies || 1} silent=${data.silent ?? true}`);
       const pq = getPrinterQueue(printerName);
       const win = pq.window;
 
@@ -918,6 +929,7 @@ function initPrintEvent() {
   // 收到 UI 给的 html 代码（news-server 渲染完成后回调）
   ipcMain.on("htmlPrint", (event, data) => {
     try {
+      logInfo("ipc-htmlPrint-recv", `taskId=${data.taskId} printer="${data.printer}" templateId=${data.templateId} htmlLen=${data.html ? data.html.length : 0}`);
       if (data && data.html) {
         // 清除渲染超时定时器
         const rendering = renderingTasks.get(data.taskId);
@@ -936,6 +948,7 @@ function initPrintEvent() {
   // 模板渲染失败回调
   ipcMain.on("htmlPrintError", (event, data) => {
     try {
+      logInfo("ipc-htmlPrintError-recv", `taskId=${data.taskId} templateId=${data.templateId} renderError=${data.renderError}`);
       // 清除渲染超时定时器
       const rendering = renderingTasks.get(data.taskId);
       if (rendering) {

@@ -3,7 +3,7 @@ const { app, BrowserWindow, BrowserView, ipcMain, Menu } = require("electron");
 const path = require("path");
 const server = require("http").createServer();
 const helper = require("./src/helper");
-const { logError, flushLogs, saveConfig, getConfig, setProcessHighPriority, setAllProcessesHighPriority } = helper;
+const { logError, flushLogs, cleanupOldLogs, saveConfig, getConfig, setProcessHighPriority, setAllProcessesHighPriority } = helper;
 const printSetup = require("./src/print");
 const address = require("address");
 
@@ -116,6 +116,12 @@ async function initialize() {
   });
   // 当electron完成初始化
   app.whenReady().then(() => {
+    // 启动时清理过期日志（保留 60 天），异步执行不阻塞窗口创建
+    try {
+      cleanupOldLogs();
+    } catch (err) {
+      logError("startup-cleanupOldLogs", err);
+    }
     // 读取用户上次的开机启动配置，首次启动默认开启
     const savedAutoStart = getConfig("autoStart", true);
     setAutoLaunch(savedAutoStart);
