@@ -676,7 +676,7 @@ async function initSocketIo() {
           data = data;
         }
         data.socketId = client.id;
-        logInfo("socket-news-server-recv", `client.id=${client.id} printer="${data.printer}" templateId=${data.templateId} templateLen=${data.template ? JSON.stringify(data.template).length : 0} params=${truncateForLog(data.params, 1000)} );
+        logInfo("socket-news-server-recv", `client.id=${client.id} printer="${data.printer}" templateId=${data.templateId} templateLen=${data.template ? JSON.stringify(data.template).length : 0} params=${truncateForLog(data.params, 1000)}` );
 
         // 先分配 taskId 并持久化，确保任务不丢失
         const taskId = nextTaskId();
