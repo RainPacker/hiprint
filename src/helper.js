@@ -6,6 +6,63 @@ const os = require("os");
 const { execSync } = require("child_process");
 
 /**
+ * 安全地将任意值转为日志友好的字符串，并按长度截断
+ * 用于记录 socket.io 报文内容预览，避免大 payload 撑爆日志文件
+ * - 字符串：直接截断
+ * - 对象/数组：JSON.stringify 后截断（自动处理循环引用）
+ * - Buffer：转为 hex 预览
+ * - undefined/null：返回 "undefined"/"null"
+ * @param {*} value - 任意值
+ * @param {number} maxLen - 最大保留长度，默认 500
+ * @returns {string}
+ */
+function truncateForLog(value, maxLen) {
+  maxLen = maxLen || 500;
+  try {
+    let str;
+    if (value === undefined) {
+      return "undefined";
+    }
+    if (value === null) {
+      return "null";
+    }
+    if (Buffer.isBuffer(value)) {
+      // Buffer 转 hex 预览，长度翻倍所以减半
+      const halfLen = Math.floor(maxLen / 2);
+      str = "Buffer(hex):" + value.slice(0, halfLen).toString("hex");
+      if (value.length > halfLen) {
+        str += `...(total=${value.length}bytes)`;
+      }
+      return str;
+    }
+    if (typeof value === "string") {
+      str = value;
+    } else {
+      // 对象/数组：JSON.stringify，处理循环引用
+      const seen = new WeakSet();
+      str = JSON.stringify(value, (key, val) => {
+        if (typeof val === "object" && val !== null) {
+          if (seen.has(val)) {
+            return "[Circular]";
+          }
+          seen.add(val);
+        }
+        if (Buffer.isBuffer(val)) {
+          return `Buffer(${val.length}bytes)`;
+        }
+        return val;
+      });
+    }
+    if (str && str.length > maxLen) {
+      return str.slice(0, maxLen) + `...(total=${str.length})`;
+    }
+    return str;
+  } catch (e) {
+    return "[truncateError:" + e.message + "]";
+  }
+}
+
+/**
  * 崩溃日志目录
  */
 function getLogDir() {
@@ -371,6 +428,7 @@ exports.logError = logError;
 exports.logInfo = logInfo;
 exports.flushLogs = flushLogs;
 exports.cleanupOldLogs = cleanupOldLogs;
+exports.truncateForLog = truncateForLog;
 exports.isMainWindowAvailable = isMainWindowAvailable;
 exports.safeSendToMain = safeSendToMain;
 exports.safeGetPrinters = safeGetPrinters;

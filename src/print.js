@@ -3,7 +3,7 @@
 const { app, BrowserWindow, ipcMain, Tray, Menu } = require("electron");
 const path = require("path");
 const helper = require("./helper");
-const { logError, logInfo, flushLogs, safeSendToMain, safeGetPrinters, isMainWindowAvailable, saveConfig, setProcessHighPriority } = helper;
+const { logError, logInfo, flushLogs, truncateForLog, safeSendToMain, safeGetPrinters, isMainWindowAvailable, saveConfig, setProcessHighPriority } = helper;
 const address = require("address");
 const ipp = require("ipp");
 const store = require("./store");
@@ -654,7 +654,7 @@ async function initSocketIo() {
     client.emit("printerList", safeGetPrinters());
     client.on("news", (data) => {
       try {
-        logInfo("socket-news-recv", `client.id=${client.id} printer="${data && data.printer}" templateId=${data && data.templateId} htmlLen=${data && data.html ? data.html.length : 0}`);
+        logInfo("socket-news-recv", `client.id=${client.id} printer="${data && data.printer}" templateId=${data && data.templateId} htmlLen=${data && data.html ? data.html.length : 0} copies=${data && data.copies} preview=${truncateForLog(data && data.html, 200)}`);
         if (data && data.html) {
           data.printer = data.printer;
           data.socketId = client.id;
@@ -668,6 +668,7 @@ async function initSocketIo() {
     });
     // 从服务端非前端（先持久化再渲染，防止中间环节丢失）
     client.on("news-server", (data) => {
+      logInfo("socket-news-server-recv", `client.id=${client.id} data="${data}"`);
       try {
         try {
           data = JSON.parse(data);
@@ -675,7 +676,7 @@ async function initSocketIo() {
           data = data;
         }
         data.socketId = client.id;
-        logInfo("socket-news-server-recv", `client.id=${client.id} printer="${data.printer}" templateId=${data.templateId} templateLen=${data.template ? JSON.stringify(data.template).length : 0}`);
+        logInfo("socket-news-server-recv", `client.id=${client.id} printer="${data.printer}" templateId=${data.templateId} templateLen=${data.template ? JSON.stringify(data.template).length : 0} params=${truncateForLog(data.params, 1000)} );
 
         // 先分配 taskId 并持久化，确保任务不丢失
         const taskId = nextTaskId();
@@ -760,7 +761,7 @@ async function initSocketIo() {
     client.on("ippPrint", (options) => {
       try {
         const { url, opt, action, message } = options;
-        logInfo("socket-ippPrint-recv", `client.id=${client.id} action=${action} url=${url}`);
+        logInfo("socket-ippPrint-recv", `client.id=${client.id} action=${action} url=${url} opt=${truncateForLog(opt, 200)} message=${truncateForLog(message, 300)}`);
         let printer = ipp.Printer(url, opt);
         client.emit("ippPrinterConnected", printer);
         let msg = Object.assign(
@@ -805,7 +806,7 @@ async function initSocketIo() {
     client.on("ippRequest", (options) => {
       try {
         const { url, data } = options;
-        logInfo("socket-ippRequest-recv", `client.id=${client.id} url=${url} dataLen=${data ? data.length : 0}`);
+        logInfo("socket-ippRequest-recv", `client.id=${client.id} url=${url} dataLen=${data ? data.length : 0} dataPreview=${truncateForLog(data, 200)}`);
         let _data = ipp.serialize(data);
         ipp.request(url, _data, function(err, res) {
           try {
@@ -929,7 +930,7 @@ function initPrintEvent() {
   // 收到 UI 给的 html 代码（news-server 渲染完成后回调）
   ipcMain.on("htmlPrint", (event, data) => {
     try {
-      logInfo("ipc-htmlPrint-recv", `taskId=${data.taskId} printer="${data.printer}" templateId=${data.templateId} htmlLen=${data.html ? data.html.length : 0}`);
+      logInfo("ipc-htmlPrint-recv", `taskId=${data.taskId} printer="${data.printer}" templateId=${data.templateId} htmlLen=${data.html ? data.html.length : 0} htmlPreview=${truncateForLog(data.html, 200)}`);
       if (data && data.html) {
         // 清除渲染超时定时器
         const rendering = renderingTasks.get(data.taskId);
