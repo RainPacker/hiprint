@@ -349,13 +349,18 @@ async function loadingView(windowOptions) {
       if (!MAIN_WINDOW.isDestroyed()) {
         MAIN_WINDOW.removeBrowserView(loadingBrowserView);
       }
-      // 销毁 BrowserView 的 webContents，防止渲染进程泄漏导致内存持续占用
-      if (loadingBrowserView.webContents && !loadingBrowserView.webContents.isDestroyed()) {
-        loadingBrowserView.webContents.destroy();
-      }
     } catch (err) {
       logError("loadingView-remove", err);
     }
+    // 延迟销毁 webContents，避免在 dom-ready 回调中立即销毁影响主窗口渲染
+    // 导致 loading 动画残留与主页面同时显示
+    setTimeout(() => {
+      try {
+        if (loadingBrowserView.webContents && !loadingBrowserView.webContents.isDestroyed()) {
+          loadingBrowserView.webContents.destroy();
+        }
+      } catch (e) { /* 忽略销毁异常 */ }
+    }, 2000);
   });
 }
 
@@ -366,21 +371,50 @@ async function systemSetup() {
   Menu.setApplicationMenu(null);
 }
 
-// 获取设备唯一id
-ipcMain.on("getMachineId", function(event) {
+// 获取设备唯一id（恢复 node-machine-id 原始机器GUID，保证与服务器端设备注册一致）
+// 缓存结果：execSync 只执行一次，避免重复调用在服务器上触发 EPIPE
+let _machineIdCache = null;
+function getMachineIdOnce() {
+  if (_machineIdCache) return _machineIdCache;
   try {
     const { machineIdSync } = require("node-machine-id");
-    event.sender.send("machineId", machineIdSync({ original: true }));
+    _machineIdCache = machineIdSync({ original: true });
   } catch (err) {
     console.error("[getMachineId] 获取机器ID失败:", err.message);
-    // 回退：使用用户数据目录路径作为简易唯一标识
-    event.sender.send("machineId", app.getPath("userData").replace(/[\\\/]/g, "_"));
+    // 回退：用主机名+MAC地址生成稳定唯一ID（不随安装路径变化）
+    try {
+      const os = require("os");
+      const crypto = require("crypto");
+      const hostname = os.hostname();
+      const nets = os.networkInterfaces();
+      let mac = "";
+      for (const name of Object.keys(nets)) {
+        for (const net of nets[name]) {
+          if (!net.internal && net.mac && net.mac !== "00:00:00:00:00:00") {
+            mac = net.mac;
+            break;
+          }
+        }
+        if (mac) break;
+      }
+      _machineIdCache = "fb-" + crypto.createHash("sha256").update(hostname + mac).digest("hex");
+    } catch (e) {
+      _machineIdCache = app.getPath("userData").replace(/[\\\/]/g, "_");
+    }
   }
+  return _machineIdCache;
+}
+
+ipcMain.on("getMachineId", function (event) {
+  event.sender.send("machineId", getMachineIdOnce());
 });
 
 // 获取设备ip、mac等信息
 ipcMain.on("getAddress", function(event) {
   address(function(err, arg) {
+    if (err || !arg) {
+      arg = { ip: "127.0.0.1", mac: "unknown" };
+    }
     event.sender.send("address", arg);
   });
 });
