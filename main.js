@@ -1,4 +1,40 @@
+// ============ 启动诊断（必须在最早期，捕获闪退真实原因）============
+// 不依赖任何业务模块，仅用 node 内置 fs/path 同步写入
+const _diagFs = require("fs");
+const _diagPath = require("path");
+const _diagLogPath = _diagPath.join(process.env.APPDATA || process.env.HOME || __dirname, "electron-hiprint", "diag-startup.log");
+function _diagLog(msg) {
+  try {
+    const _dir = _diagPath.dirname(_diagLogPath);
+    if (!_diagFs.existsSync(_dir)) _diagFs.mkdirSync(_dir, { recursive: true });
+    _diagFs.appendFileSync(_diagLogPath, `[${new Date().toISOString()}] ${msg}\n`, "utf-8");
+  } catch (e) { /* 诊断不能影响主流程 */ }
+}
+_diagLog("==== 诊断启动开始 ====");
+_diagLog(`versions: node=${process.versions.node} electron=${process.versions.electron} chrome=${process.versions.chrome}`);
+_diagLog(`env: platform=${process.platform} arch=${process.arch} cwd=${process.cwd()}`);
+_diagLog(`argv: ${JSON.stringify(process.argv)}`);
+_diagLog(`__dirname: ${__dirname}`);
+// 捕获所有进程级退出路径，确保闪退前能留下日志
+process.on("exit", (code) => _diagLog(`process.on(exit) code=${code}`));
+process.on("SIGINT", () => _diagLog("process.on(SIGINT)"));
+process.on("SIGTERM", () => _diagLog("process.on(SIGTERM)"));
+// 定时记录内存使用，捕获内存泄漏导致闪退
+let _memMonitorTimer = null;
+function _startMemMonitor() {
+  if (_memMonitorTimer) return;
+  _memMonitorTimer = setInterval(() => {
+    try {
+      const m = process.memoryUsage();
+      _diagLog(`[内存监控] rss=${Math.round(m.rss / 1048576)}MB heapUsed=${Math.round(m.heapUsed / 1048576)}MB heapTotal=${Math.round(m.heapTotal / 1048576)}MB external=${Math.round(m.external / 1048576)}MB`);
+    } catch (e) { }
+  }, 10000);
+}
+// 注意：不手动启动 crashReporter，Electron 打包应用默认已内置 Crashpad 崩溃捕获
+// 手动调用 crashReporter.start() 在打包模式下会触发 native 崩溃
+
 const { app, BrowserWindow, BrowserView, ipcMain, Menu } = require("electron");
+_diagLog("require(electron) 完成");
 
 const path = require("path");
 const server = require("http").createServer();
@@ -6,6 +42,7 @@ const helper = require("./src/helper");
 const { logError, flushLogs, cleanupOldLogs, saveConfig, getConfig, setProcessHighPriority, setAllProcessesHighPriority } = helper;
 const printSetup = require("./src/print");
 const address = require("address");
+_diagLog("业务模块 require 完成（helper, print, address, http, socket.io 待创建）");
 
 // Windows Server 缺少 GPU 驱动时，Chromium 渲染会崩溃闪退
 // 必须在 app.ready 之前设置
@@ -19,9 +56,11 @@ app.commandLine.appendSwitch("disable-gpu-sandbox");
 app.commandLine.appendSwitch("disable-background-timer-throttling");
 app.commandLine.appendSwitch("disable-renderer-backgrounding");
 app.commandLine.appendSwitch("disable-backgrounding-occluded-windows");
+_diagLog("commandLine switches 设置完成");
 
 // 设置主进程为高优先级，确保打印任务及时响应
 global.PROCESS_PRIORITY = setProcessHighPriority(process.pid);
+_diagLog(`setProcessHighPriority 完成 result=${global.PROCESS_PRIORITY}`);
 
 // 主进程
 global.MAIN_WINDOW = null;
@@ -35,8 +74,8 @@ global.server = server;
 const io = require("socket.io")(server, {
   pingInterval: 10000,
   pingTimeout: 5000,
-  // 限制为 500MB，防止大 payload 导致内存溢出闪退
-  maxHttpBufferSize: 5e8,
+  // 限制为 50MB，防止大 payload 导致内存溢出闪退（原500MB过大易致服务器OOM）
+  maxHttpBufferSize: 5e7,
   allowEIO3: true, // 兼容 Socket.IO 2.x
   // 跨域问题(Socket.IO 3.x 使用这种方式)
   cors: {
@@ -53,6 +92,7 @@ const io = require("socket.io")(server, {
   },
 });
 global.io = io;
+_diagLog("socket.io 实例创建完成");
 
 global.socketStore = {};
 
@@ -68,6 +108,7 @@ process.on("unhandledRejection", (reason, promise) => {
 });
 
 // ========== 开机启动 ==========
+_diagLog("全局异常处理器已注册（uncaughtException, unhandledRejection）");
 // 全局开关状态，供托盘菜单读取/切换
 global.AUTO_START = false;
 
@@ -103,8 +144,11 @@ function getAutoLaunch() {
 async function initialize() {
   // 限制一个窗口
   const gotTheLock = app.requestSingleInstanceLock();
+  _diagLog(`requestSingleInstanceLock gotTheLock=${gotTheLock}`);
   if (!gotTheLock) {
+    _diagLog("未获取单实例锁，准备退出（这可能是用户感知'闪退'的原因：已有实例在后台运行）");
     helper.appQuit();
+    return;
   }
   app.on("second-instance", (event) => {
     if (MAIN_WINDOW) {
@@ -116,17 +160,22 @@ async function initialize() {
   });
   // 当electron完成初始化
   app.whenReady().then(() => {
+    _diagLog("app.whenReady 触发，开始初始化");
     // 启动时清理过期日志（保留 60 天），异步执行不阻塞窗口创建
     try {
       cleanupOldLogs();
     } catch (err) {
       logError("startup-cleanupOldLogs", err);
+      _diagLog(`cleanupOldLogs 异常: ${err.message}`);
     }
     // 读取用户上次的开机启动配置，首次启动默认开启
     const savedAutoStart = getConfig("autoStart", true);
+    _diagLog(`getConfig autoStart=${savedAutoStart}`);
     setAutoLaunch(savedAutoStart);
+    _diagLog("setAutoLaunch 完成");
     // 创建浏览器窗口
     createWindow();
+    _diagLog("createWindow 已调用（异步执行中）");
     app.on("activate", function() {
       if (BrowserWindow.getAllWindows().length === 0) {
         createWindow();
@@ -135,21 +184,26 @@ async function initialize() {
 
     // 监听所有子进程崩溃（GPU/Renderer/Utility/Network 等）
     app.on("child-process-gone", (event, details) => {
+      _diagLog(`[child-process-gone] type=${details.type} reason=${details.reason} exitCode=${details.exitCode}`);
       logError("child-process-gone", `type=${details.type} reason=${details.reason} exitCode=${details.exitCode}`);
     });
   });
   // 关闭了所有窗口
   app.on("window-all-closed", function() {
+    _diagLog("window-all-closed 触发（所有窗口已关闭，即将退出）");
     if (process.platform !== "darwin") {
       helper.appQuit();
     }
   });
   // 应用退出前持久化未完成的打印任务
   app.on("before-quit", () => {
+    _diagLog("before-quit 触发（应用即将退出）");
     if (printSetup.flushPendingTasks) {
       printSetup.flushPendingTasks();
     }
   });
+  app.on("will-quit", () => _diagLog("will-quit 触发"));
+  app.on("quit", (event, exitCode) => _diagLog(`quit 触发 exitCode=${exitCode}`));
 }
 
 // 主窗口
@@ -176,14 +230,17 @@ async function createWindow() {
   };
   // win 左上角图标(暂处理：打包后这样设置无法显示...)
   // 若package.json 中设置 .ico 开发可显示，打包后不显示
-  if (process.platform === "win32" && process.env.NODE_ENV !== "production") {
+  // 同样用 app.isPackaged 判断，避免打包后设置 asar 内无效路径导致图标加载失败警告
+  if (process.platform === "win32" && !app.isPackaged) {
     windowOptions.icon = path.join(__dirname, "build/icons/256x256.png");
   }
 
   MAIN_WINDOW = new BrowserWindow(windowOptions);
+  _diagLog("BrowserWindow 创建完成");
 
   // 开机启动时带 --hidden 参数，静默启动到托盘
   const startHidden = process.argv.includes("--hidden");
+  _diagLog(`startHidden=${startHidden} argv含--hidden=${startHidden}`);
   if (startHidden) {
     MAIN_WINDOW.hide();
     MAIN_WINDOW.setSkipTaskbar(true);
@@ -191,14 +248,17 @@ async function createWindow() {
 
   // 白屏的问题
   await loadingView(windowOptions);
+  _diagLog("loadingView 完成");
   // MAIN_WINDOW.once("ready-to-show", () => {
   //   MAIN_WINDOW.show();
   // });
 
   // 系统相关
   await systemSetup();
+  _diagLog("systemSetup 完成");
   // 加载主页面（打包后需处理 asar 路径）
   let indexPath = path.join(__dirname, "/assets/index.html");
+  _diagLog(`loadURL 开始 indexPath=${indexPath} exists=${require("fs").existsSync(indexPath.replace(/\//g, "\\"))}`);
   MAIN_WINDOW.webContents.loadURL("file://" + indexPath);
 
   // 主窗口 dom-ready 后批量设置所有进程优先级
@@ -211,8 +271,10 @@ async function createWindow() {
     }, 3000);
   });
 
-  // 仅在开发环境打开 DevTools，生产环境打开可能导致 WinServer 渲染异常
-  if (process.env.NODE_ENV !== "production") {
+  // 仅在开发环境打开 DevTools
+  // 必须用 app.isPackaged 判断，不能用 NODE_ENV（打包后该变量未设置，条件恒为真会导致生产环境也打开 DevTools）
+  // 服务器环境（WinServer/GPU驱动不完整）下 DevTools 大量日志会导致渲染进程崩溃闪退
+  if (!app.isPackaged) {
     MAIN_WINDOW.webContents.openDevTools();
   }
 
@@ -255,7 +317,14 @@ async function createWindow() {
     }
   });
   // 打印相关
+  _diagLog("printSetup 开始（initTray + initSocketIo + initPrintEvent + restorePendingTasks）");
   await printSetup();
+  _diagLog("printSetup 完成（托盘/socket/打印事件/任务恢复全部就绪）");
+
+  // 启动定时内存监控，捕获内存泄漏导致闪退
+  const _initMem = process.memoryUsage();
+  _diagLog(`[内存初始] rss=${Math.round(_initMem.rss / 1048576)}MB heapUsed=${Math.round(_initMem.heapUsed / 1048576)}MB heapTotal=${Math.round(_initMem.heapTotal / 1048576)}MB`);
+  _startMemMonitor();
 
   return MAIN_WINDOW;
 }
@@ -279,6 +348,10 @@ async function loadingView(windowOptions) {
     try {
       if (!MAIN_WINDOW.isDestroyed()) {
         MAIN_WINDOW.removeBrowserView(loadingBrowserView);
+      }
+      // 销毁 BrowserView 的 webContents，防止渲染进程泄漏导致内存持续占用
+      if (loadingBrowserView.webContents && !loadingBrowserView.webContents.isDestroyed()) {
+        loadingBrowserView.webContents.destroy();
       }
     } catch (err) {
       logError("loadingView-remove", err);

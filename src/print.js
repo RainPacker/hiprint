@@ -26,7 +26,8 @@ const RENDER_TIMEOUT = 15000;
 // 空闲窗口回收延时（毫秒），打印完成后空闲此时间则自动销毁
 const IDLE_WINDOW_TIMEOUT = 60000;
 // 最少保留的窗口数，空闲回收时不低于此数量
-const MIN_KEEP_WINDOWS = 5;
+// 从5降为2：每个渲染进程约占200-400MB，5个窗口可能导致2G内存+9进程导致服务器OOM闪退
+const MIN_KEEP_WINDOWS = 2;
 // 单个窗口最大复用次数，超过后强制销毁重建，避免渲染进程内存累积导致硬崩溃
 // 渲染进程长期不重启会累积 hiprint 状态/内存碎片，最终可能在 IPC send 时引发底层崩溃
 const MAX_WINDOW_REUSE = 50;
