@@ -1,0 +1,288 @@
+// ========== 外部保活机制（Windows 计划任务 Task Scheduler）==========
+// 进程内看门狗无法拯救主进程自身硬崩溃（如打印机驱动层崩溃），
+// 本模块通过系统计划任务实现进程级外部保活：
+//   1. 注册一个每分钟运行一次的计划任务（schtasks，当前用户权限，无需管理员）
+//   2. 任务执行 userData 目录下自动生成的 keepalive.ps1：
+//      - 应用存活 → 立即退出（不打日志）
+//      - 应用不存在（闪退/被杀）→ 静默拉起（--hidden 启动到托盘）
+//      - 存在 graceful-exit.flag（用户主动退出）→ 不拉起
+//   3. 用户托盘"退出"时写标记，应用启动时清除标记（恢复保活）
+// 计划任务注册/脚本生成均在应用侧完成，重新注册（/F 覆盖）可自愈 exe 路径变化
+
+const { execFileSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const { app } = require("electron");
+
+// 计划任务名称（注册表/任务计划程序中显示的名字）
+const TASK_NAME = "electron-hiprint-keepalive";
+
+let _logFn = null;
+/**
+ * 注入日志函数（避免与 helper.js 循环依赖）
+ */
+function setLogger(logInfoFn, logErrorFn) {
+  _logFn = { info: logInfoFn, error: logErrorFn };
+}
+function log(category, msg, isErr) {
+  if (_logFn) {
+    isErr ? _logFn.error(category, msg) : _logFn.info(category, msg);
+  }
+}
+
+function getUserDataDir() {
+  return app.getPath("userData");
+}
+function getScriptPath() {
+  return path.join(getUserDataDir(), "keepalive.ps1");
+}
+function getXmlPath() {
+  return path.join(getUserDataDir(), "keepalive-task.xml");
+}
+function getFlagPath() {
+  return path.join(getUserDataDir(), "graceful-exit.flag");
+}
+
+/**
+ * 写入"优雅退出"标记：用户主动退出应用后，保活脚本看到此标记不再拉起，
+ * 直到用户下次手动启动应用（启动时清除标记）后恢复保活。
+ * 闪退/崩溃来不及写任何标记，因此保活脚本会正常拉起——这正是保活的目标
+ */
+function markGracefulExit() {
+  try {
+    fs.writeFileSync(getFlagPath(), String(Date.now()), "utf-8");
+    log("keepalive-graceful-exit", "用户主动退出，已写入标记，外部保活将跳过拉起");
+  } catch (err) {
+    log("keepalive-graceful-exit", err && err.message, true);
+  }
+}
+
+/**
+ * 清除"优雅退出"标记（应用启动时调用，恢复外部保活）
+ */
+function clearGracefulExit() {
+  try {
+    if (fs.existsSync(getFlagPath())) {
+      fs.unlinkSync(getFlagPath());
+      log("keepalive-clear-flag", "已清除优雅退出标记，外部保活恢复");
+    }
+  } catch (err) {
+    log("keepalive-clear-flag", err && err.message, true);
+  }
+}
+
+/**
+ * 生成 PowerShell 保活脚本（写入 userData，不受 asar 打包影响）
+ * 脚本逻辑：存在优雅退出标记 → 跳过；进程存活 → 退出；否则静默拉起
+ */
+function writeKeepAliveScript() {
+  const exePath = process.execPath.replace(/'/g, "''");
+  const procName = path.basename(process.execPath, ".exe").replace(/'/g, "''");
+
+  const script = [
+    "# electron-hiprint 进程保活脚本（由应用自动生成，请勿手工编辑）",
+    "# 由 Windows 计划任务 electron-hiprint-keepalive 每分钟调用一次",
+    `$procName = '${procName}'`,
+    `$exePath  = '${exePath}'`,
+    "$baseDir  = Join-Path $env:APPDATA 'electron-hiprint'",
+    "$flagFile = Join-Path $baseDir 'graceful-exit.flag'",
+    "$logDir   = Join-Path $baseDir 'logs'",
+    "$logFile  = Join-Path $logDir 'keepalive.log'",
+    "",
+    "function Write-KeepLog($msg) {",
+    "  try {",
+    "    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }",
+    "    $line = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg",
+    "    Add-Content -Path $logFile -Value $line -Encoding UTF8",
+    "    # 简单轮转：超过 2MB 只保留最后 200 行，防止日志无限增长",
+    "    if ((Get-Item $logFile -ErrorAction SilentlyContinue).Length -gt 2MB) {",
+    "      $tail = Get-Content $logFile -Tail 200",
+    "      Set-Content -Path $logFile -Value $tail -Encoding UTF8",
+    "    }",
+    "  } catch { }",
+    "}",
+    "",
+    "# 用户已主动退出：不拉起，等待用户下次手动启动应用",
+    "if (Test-Path $flagFile) { Write-KeepLog 'skip: 用户已主动退出(graceful-exit)，不拉起'; exit 0 }",
+    "",
+    "# 进程存活检查：优先按可执行文件完整路径精确匹配（避免同名进程误判），",
+    "# 拿不到进程路径时（权限受限）回退为按进程名存在即认为存活（宁可漏拉不可错拉）",
+    "$procs = @(Get-Process -Name $procName -ErrorAction SilentlyContinue)",
+    "if ($procs.Count -gt 0) {",
+    "  $alive = $false",
+    "  foreach ($p in $procs) {",
+    "    try {",
+    "      if ($p.Path -and ($p.Path -ieq $exePath)) { $alive = $true; break }",
+    "    } catch { }",
+    "  }",
+    "  if (-not $alive) { $alive = $true } # 路径匹配失败时保守认为存活",
+    "  if ($alive) { exit 0 }",
+    "}",
+    "",
+    "Write-KeepLog (\"进程 {0} 不存在（疑似闪退/被杀），自动拉起: {1}\" -f $procName, $exePath)",
+    "try {",
+    "  Start-Process -FilePath $exePath -ArgumentList '--hidden' -WindowStyle Hidden",
+    "  Write-KeepLog '拉起成功'",
+    "} catch {",
+    "  Write-KeepLog (\"拉起失败: {0}\" -f $_.Exception.Message)",
+    "}",
+    "",
+  ].join("\r\n");
+
+  fs.writeFileSync(getScriptPath(), script, "utf-8");
+}
+
+/**
+ * 生成计划任务 XML 定义（UTF-16 编码，schtasks /XML 要求）
+ * 触发器：一次性起点 + 每分钟无限重复；Principal 用 InteractiveToken（当前用户，无需密码/管理员）
+ */
+function writeTaskXml() {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const startBoundary = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  const args = `-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "${getScriptPath()}"`;
+
+  const xml = `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>electron-hiprint 打印客户端进程保活：每分钟检查，应用异常退出（闪退/被杀）后自动静默拉起。由应用内托盘菜单管理，可随时关闭。</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>${startBoundary}</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>false</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>${args.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+`;
+  // schtasks /XML 要求 UTF-16（带 BOM）
+  fs.writeFileSync(getXmlPath(), "\ufeff" + xml, "utf16le");
+}
+
+/**
+ * 执行 schtasks 命令（同步，注册/查询/删除均为一次性低频操作）
+ */
+function runSchtasks(args) {
+  return execFileSync("schtasks", args, {
+    windowsHide: true,
+    timeout: 20000,
+    encoding: "utf-8",
+  });
+}
+
+/**
+ * 查询计划任务是否已注册
+ * @returns {boolean}
+ */
+function isRegistered() {
+  if (process.platform !== "win32") return false;
+  try {
+    runSchtasks(["/Query", "/TN", TASK_NAME]);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * 注册（或覆盖重建）保活计划任务。每次应用启动调用一次：
+ * /F 覆盖语义同时可自愈 exe 路径变化（升级安装后路径/版本号变化）
+ * @throws {Error} 注册失败时抛出（含 schtasks stderr）
+ */
+function register() {
+  if (process.platform !== "win32") {
+    throw new Error("外部保活仅支持 Windows 平台");
+  }
+  writeKeepAliveScript();
+  writeTaskXml();
+  try {
+    runSchtasks(["/Create", "/F", "/TN", TASK_NAME, "/XML", getXmlPath()]);
+  } catch (e) {
+    const detail = (e.stderr || e.message || "").trim();
+    log("keepalive-register", `注册计划任务失败: ${detail}`, true);
+    throw new Error(`schtasks 注册失败: ${detail}`);
+  }
+  // 注册成功后顺手清理临时 XML（保留亦可，留档便于排查）
+  try { fs.unlinkSync(getXmlPath()); } catch (e) { /* 忽略 */ }
+  log("keepalive-register", `计划任务 "${TASK_NAME}" 注册成功（每分钟检查，进程不存在时自动拉起）`);
+}
+
+/**
+ * 注销保活计划任务（托盘关闭开关时调用），幂等
+ */
+function unregister() {
+  if (process.platform !== "win32") return;
+  try {
+    runSchtasks(["/Delete", "/F", "/TN", TASK_NAME]);
+    log("keepalive-unregister", `计划任务 "${TASK_NAME}" 已注销`);
+  } catch (e) {
+    // 任务不存在时 schtasks 返回非 0，属正常情况，不算错误
+    log("keepalive-unregister", "计划任务不存在或已注销（幂等）");
+  }
+}
+
+/**
+ * 应用启动时初始化外部保活：
+ * 1. 清除优雅退出标记（用户手动启动 = 恢复保活意愿）
+ * 2. 按配置注册或注销计划任务
+ * @param {boolean} enabled - 配置项 keepAlive
+ */
+function init(enabled) {
+  if (process.platform !== "win32") {
+    log("keepalive-init", "非 Windows 平台，跳过外部保活");
+    return;
+  }
+  clearGracefulExit();
+  try {
+    if (enabled) {
+      register();
+    } else {
+      unregister();
+    }
+  } catch (err) {
+    // 注册失败不影响应用启动（如域策略禁止创建计划任务）
+    log("keepalive-init", `初始化失败: ${err.message}`, true);
+  }
+}
+
+module.exports = {
+  TASK_NAME,
+  setLogger,
+  markGracefulExit,
+  clearGracefulExit,
+  isRegistered,
+  register,
+  unregister,
+  init,
+};

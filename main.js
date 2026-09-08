@@ -39,8 +39,9 @@ _diagLog("require(electron) 完成");
 const path = require("path");
 const server = require("http").createServer();
 const helper = require("./src/helper");
-const { logError, flushLogs, cleanupOldLogs, saveConfig, getConfig, setProcessHighPriority, setAllProcessesHighPriority } = helper;
+const { logError, logInfo, flushLogs, cleanupOldLogs, saveConfig, getConfig, setProcessHighPriority, setAllProcessesHighPriority } = helper;
 const printSetup = require("./src/print");
+const keepalive = require("./src/keepalive");
 const address = require("address");
 _diagLog("业务模块 require 完成（helper, print, address, http, socket.io 待创建）");
 
@@ -173,6 +174,18 @@ async function initialize() {
     _diagLog(`getConfig autoStart=${savedAutoStart}`);
     setAutoLaunch(savedAutoStart);
     _diagLog("setAutoLaunch 完成");
+    // 外部保活：Windows 计划任务每分钟检查进程，闪退/被杀后自动拉起
+    // （内部含清除"优雅退出"标记：用户手动启动应用即恢复保活意愿）
+    try {
+      keepalive.setLogger(logInfo, logError);
+      const savedKeepAlive = getConfig("keepAlive", true);
+      _diagLog(`getConfig keepAlive=${savedKeepAlive}`);
+      keepalive.init(savedKeepAlive);
+      global.KEEPALIVE_ENABLED = savedKeepAlive && keepalive.isRegistered();
+    } catch (err) {
+      logError("keepalive-init", err);
+      _diagLog(`keepalive 初始化异常: ${err.message}`);
+    }
     // 创建浏览器窗口
     createWindow();
     _diagLog("createWindow 已调用（异步执行中）");

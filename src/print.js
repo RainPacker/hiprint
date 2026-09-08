@@ -842,11 +842,47 @@ async function initTray() {
           }
         },
       },
+      {
+        label: "进程保活（计划任务）",
+        type: "checkbox",
+        checked: global.KEEPALIVE_ENABLED || false,
+        visible: process.platform === "win32",
+        click: (menuItem) => {
+          const keepalive = require("./keepalive");
+          try {
+            if (menuItem.checked) {
+              keepalive.register();
+            } else {
+              keepalive.unregister();
+            }
+            global.KEEPALIVE_ENABLED = menuItem.checked;
+            // 持久化用户选择，重启后记住配置
+            saveConfig("keepAlive", menuItem.checked);
+            // 通知页面更新显示
+            safeSendToMain("keepaliveStatus", menuItem.checked);
+            logInfo("tray-keepalive", `外部保活(计划任务)已${menuItem.checked ? "开启" : "关闭"}`);
+          } catch (err) {
+            // 注册失败（如域策略限制），回退勾选状态
+            menuItem.checked = !menuItem.checked;
+            global.KEEPALIVE_ENABLED = menuItem.checked;
+            logError("tray-keepalive", err);
+          }
+          // 重建菜单以更新勾选状态
+          APP_TRAY.setContextMenu(Menu.buildFromTemplate(buildTrayMenu()));
+        },
+      },
       { type: "separator" },
       {
         label: "退出",
         click: () => {
           flushPendingTasks(); // 退出前持久化未完成任务
+          // 用户主动退出：写优雅退出标记，外部保活计划任务检测到后不再拉起
+          // （闪退/被杀不会走这里，无标记 → 一分钟内被计划任务自动拉起）
+          try {
+            require("./keepalive").markGracefulExit();
+          } catch (err) {
+            helper.logError("keepalive-mark-exit", err);
+          }
           if (MAIN_WINDOW && !MAIN_WINDOW.isDestroyed()) {
             MAIN_WINDOW.destroy();
           }
