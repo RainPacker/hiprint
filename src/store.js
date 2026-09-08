@@ -12,6 +12,9 @@ const STORE_FILE = path.join(STORE_DIR, "pending-tasks.json");
 let _taskCache = null;
 let _saveTimer = null;
 const SAVE_DEBOUNCE_MS = 500;
+// 持久化任务数上限：防止异常场景（反复崩溃重启）任务无限堆积，
+// 文件越积越大 → 每次启动全量读入内存 + 同步写大 JSON → 内存暴涨/主进程阻塞闪退
+const MAX_PERSISTED_TASKS = 200;
 
 /**
  * 确保存储目录存在
@@ -99,6 +102,8 @@ function addTask(data) {
     _resolvedPrinter: data._resolvedPrinter,
     html: data.html,
     template: data.template,
+    // news-server 任务的渲染参数（index.html 中使用 data.data 渲染），不存则恢复后无法重渲染
+    params: data.params !== undefined ? data.params : data.data,
     templateId: data.templateId,
     title: data.title,
     socketId: data.socketId,
@@ -110,17 +115,27 @@ function addTask(data) {
     scaleFactor: data.scaleFactor,
     pagesPerSheet: data.pagesPerSheet,
     collate: data.collate,
-    copies: data.copies,
+    // copies 归一化：0/负数为非法值（Windows DEVMODE.dmCopies 必须>=1），
+    // news-server 实测会发 copies:0，原样持久化会导致恢复后打印崩溃
+    copies: data.copies && data.copies > 0 ? Math.floor(data.copies) : 1,
     pageRanges: data.pageRanges,
     duplexMode: data.duplexMode,
     dpi: data.dpi,
     header: data.header,
     footer: data.footer,
     pageSize: data.pageSize,
+    // 重试计数：用于识别"毒任务"（一渲染/打印就崩溃），超过次数上限后启动时丢弃
+    retryCount: data.retryCount || 0,
     status: "pending",
     createdAt: Date.now(),
   };
   tasks.push(storeData);
+  // 超上限时丢弃最旧的任务，防止持久化文件无限膨胀
+  if (_taskCache.length > MAX_PERSISTED_TASKS) {
+    const dropped = _taskCache.length - MAX_PERSISTED_TASKS;
+    _taskCache = _taskCache.slice(-MAX_PERSISTED_TASKS);
+    console.log(`[store] 持久化任务超过上限(${MAX_PERSISTED_TASKS})，丢弃最旧 ${dropped} 个`);
+  }
   scheduleSave();
 }
 
@@ -135,6 +150,7 @@ function saveAllTasks(tasksData) {
     _resolvedPrinter: data._resolvedPrinter,
     html: data.html,
     template: data.template,
+    params: data.params !== undefined ? data.params : data.data,
     templateId: data.templateId,
     title: data.title,
     socketId: data.socketId,
@@ -146,17 +162,51 @@ function saveAllTasks(tasksData) {
     scaleFactor: data.scaleFactor,
     pagesPerSheet: data.pagesPerSheet,
     collate: data.collate,
-    copies: data.copies,
+    copies: data.copies && data.copies > 0 ? Math.floor(data.copies) : 1,
     pageRanges: data.pageRanges,
     duplexMode: data.duplexMode,
     dpi: data.dpi,
     header: data.header,
     footer: data.footer,
     pageSize: data.pageSize,
+    retryCount: data.retryCount || 0,
     status: "pending",
-    createdAt: Date.now(),
+    // 保留原始创建时间，用于启动时按时间过滤过期任务
+    createdAt: data.createdAt || Date.now(),
   }));
   flushSave();
+}
+
+/**
+ * 更新任务的重试计数（恢复任务时递增，超过上限即视为毒任务丢弃）
+ * @param {number} taskId - 任务ID
+ * @param {number} retryCount - 新的重试次数
+ */
+function updateRetry(taskId, retryCount) {
+  const tasks = getCache();
+  const task = tasks.find((t) => t.taskId === taskId);
+  if (task) {
+    task.retryCount = retryCount;
+    task.lastRetryAt = Date.now();
+    scheduleSave();
+  }
+}
+
+/**
+ * 获取持久化存储统计信息（用于启动诊断日志）
+ * @returns {{count: number, fileBytes: number}}
+ */
+function getStoreInfo() {
+  try {
+    const count = getCache().length;
+    let fileBytes = 0;
+    if (fs.existsSync(STORE_FILE)) {
+      fileBytes = fs.statSync(STORE_FILE).size;
+    }
+    return { count, fileBytes };
+  } catch (err) {
+    return { count: 0, fileBytes: 0, error: err.message };
+  }
 }
 
 /**
@@ -214,10 +264,12 @@ function getPendingCount() {
 module.exports = {
   addTask,
   saveAllTasks,
+  updateRetry,
   markPrinting,
   removeTask,
   getPendingTasks,
   clearAll,
   getPendingCount,
+  getStoreInfo,
   flushSave,
 };

@@ -273,10 +273,11 @@ function safeGetPrinters() {
  */
 function setProcessHighPriority(pid) {
   logInfo("setProcessHighPriority-start", `PID=${pid}`);
-  // os.setPriority 使用 POSIX 值：-20=实时, -14=高
+  // 注意：禁止使用 Realtime(-20)！Windows 上实时优先级会抢占系统调度，
+  // 导致本应用其他进程甚至整个系统"无响应"。仅使用 高(-14) → 高于正常(-4)
   const priorityLevels = [
-    { value: -20, label: "实时" },
     { value: -14, label: "高" },
+    { value: -4, label: "高于正常" },
   ];
 
   for (const level of priorityLevels) {
@@ -298,7 +299,17 @@ function setProcessHighPriority(pid) {
  * 不依赖 PowerShell，兼容所有 Windows 版本
  * @returns {string} 优先级标签
  */
+// 节流：execSync(tasklist) 是同步阻塞调用（最长 10s），频繁执行会让主进程"无响应"
+// 每次创建打印窗口都会触发此函数，必须限制执行频率
+let _lastAllPriorityAt = 0;
+const ALL_PRIORITY_THROTTLE_MS = 30000;
 function setAllProcessesHighPriority() {
+  if (Date.now() - _lastAllPriorityAt < ALL_PRIORITY_THROTTLE_MS) {
+    // 节流期内跳过，返回上次结果（新进程在下次窗口重建时会覆盖到）
+    return global.PROCESS_PRIORITY || "普通";
+  }
+  _lastAllPriorityAt = Date.now();
+
   const execName = path.basename(process.execPath);
   logInfo("setAllProcessesHighPriority-start", `进程名="${execName}"`);
 
@@ -329,10 +340,11 @@ function setAllProcessesHighPriority() {
     return "普通";
   }
 
-  // 尝试 Realtime(-20) -> High(-14) 逐个设置
+  // 尝试 高(-14) → 高于正常(-4) 逐级设置
+  // 注意：禁止 Realtime(-20)，Windows 上实时优先级会导致进程/系统无响应
   const priorityLevels = [
-    { value: -20, label: "实时" },
     { value: -14, label: "高" },
+    { value: -4, label: "高于正常" },
   ];
 
   for (const level of priorityLevels) {

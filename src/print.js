@@ -26,16 +26,37 @@ const RENDER_TIMEOUT = 15000;
 // 空闲窗口回收延时（毫秒），打印完成后空闲此时间则自动销毁
 const IDLE_WINDOW_TIMEOUT = 60000;
 // 最少保留的窗口数，空闲回收时不低于此数量
-// 从5降为2：每个渲染进程约占200-400MB，5个窗口可能导致2G内存+9进程导致服务器OOM闪退
-const MIN_KEEP_WINDOWS = 2;
+// 从5降为1：每个渲染进程约占200-400MB，多保底窗口会导致低内存服务器OOM闪退
+const MIN_KEEP_WINDOWS = 1;
 // 单个窗口最大复用次数，超过后强制销毁重建，避免渲染进程内存累积导致硬崩溃
 // 渲染进程长期不重启会累积 hiprint 状态/内存碎片，最终可能在 IPC send 时引发底层崩溃
 const MAX_WINDOW_REUSE = 50;
 
+// ========== 启动恢复防护（防止缓存任务导致"启动即打印中→闪退"死循环） ==========
+// 单个任务最大重试次数：超过视为"毒任务"（一渲染/打印就崩溃），启动恢复时直接丢弃
+const MAX_TASK_RETRY = 3;
+// 任务最长保留时间：超过 24 小时的历史任务直接丢弃（打印早已无意义）
+const TASK_MAX_AGE_MS = 24 * 3600 * 1000;
+// 单次启动最多恢复的任务数：防止启动瞬间创建大量打印窗口打爆内存
+const MAX_RESTORE_TASKS = 50;
+// 单打印机队列长度上限：超过则拒绝新任务并通知客户端，防止内存无限增长
+const MAX_QUEUE_PER_PRINTER = 100;
+
+// ========== 看门狗（保活 + 诊断日志） ==========
+// 心跳周期（毫秒）
+const WATCHDOG_INTERVAL = 10000;
+// 事件循环阻塞告警阈值（毫秒），超过说明主进程"无响应"
+const EVENTLOOP_LAG_ALERT = 5000;
+// 内存告警阈值：超过则回收空闲打印窗口
+const MEM_WARN_BYTES = 1100 * 1048576;
+// 内存危险阈值：超过则持久化任务后自动重启应用（保活，防 OOM 闪退）
+const MEM_CRITICAL_BYTES = 1600 * 1048576;
+
 // 打印机队列映射表
-// key: 打印机名称, value: { queue, isPrinting, currentTask, window, timer, idleTimer, reuseCount, renderGone }
+// key: 打印机名称, value: { queue, isPrinting, currentTask, window, timer, idleTimer, reuseCount, renderGone, pauseUntil }
 //   reuseCount: 该窗口已被复用打印的次数，达到 MAX_WINDOW_REUSE 后强制销毁重建
 //   renderGone: 渲染进程崩溃标志，true 时该窗口不可用，必须重建
+//   pauseUntil: 队列暂停截止时间戳（渲染崩溃后冷却 1 秒，避免毒任务连续崩溃打爆 CPU）
 const printerQueues = new Map();
 
 // 渲染中的任务映射表（news-server 专用）
@@ -56,6 +77,7 @@ function getPrinterQueue(printerName) {
       idleTimer: null, // 空闲窗口自动回收定时器
       reuseCount: 0,   // 当前窗口已复用打印次数
       renderGone: false, // 渲染进程是否已崩溃
+      pauseUntil: 0,   // 队列暂停截止时间戳（渲染崩溃后冷却）
     });
   }
   return printerQueues.get(printerName);
@@ -114,6 +136,26 @@ function enqueuePrintTask(data) {
   logInfo("enqueuePrintTask", `taskId=${data.taskId} printer="${printerName}" templateId=${data.templateId || "N/A"} htmlLen=${data.html ? data.html.length : 0}`);
 
   const pq = getPrinterQueue(printerName);
+
+  // 归一化 copies：0/负数为非法值（Windows DEVMODE.dmCopies 必须>=1），
+  // 部分打印机驱动收到非法 copies 会崩溃。入队时归一化，保证持久化的任务也是合法值
+  if (!data.copies || data.copies < 1) {
+    data.copies = 1;
+  }
+
+  // 队列上限保护：防止客户端异常（如死循环重发）导致内存无限增长
+  if (pq.queue.length >= MAX_QUEUE_PER_PRINTER) {
+    logError("enqueuePrintTask-overflow", `printer="${printerName}" 队列已满(${MAX_QUEUE_PER_PRINTER})，拒绝 taskId=${data.taskId}`);
+    const socket = socketStore[data.socketId];
+    if (socket) {
+      try {
+        socket.emit("error", { msg: `打印队列已满(${MAX_QUEUE_PER_PRINTER})，任务被拒绝`, templateId: data.templateId });
+      } catch (e) { /* socket 可能已断开 */ }
+    }
+    store.removeTask(data.taskId);
+    return;
+  }
+
   pq.queue.push(data);
 
   // 持久化：news-server 已在渲染前写入，这里只对 news 接口写入
@@ -131,6 +173,10 @@ function enqueuePrintTask(data) {
 function processNextTask(printerName) {
   const pq = getPrinterQueue(printerName);
   if (pq.isPrinting || pq.queue.length === 0) {
+    return;
+  }
+  // 渲染进程崩溃后的冷却期内不启动新任务，避免毒任务连续崩溃打爆 CPU
+  if (pq.pauseUntil && Date.now() < pq.pauseUntil) {
     return;
   }
 
@@ -263,20 +309,33 @@ function createPrinterWindow() {
     for (const [name, pq] of printerQueues) {
       if (pq.window === win) {
         logInfo("printWindow-render-gone", `printer="${name}" 渲染进程崩溃，重置队列 reuseCount=${pq.reuseCount}`);
-        // 标记渲染进程已崩溃，后续 ensurePrinterWindow 会强制重建窗口
-        pq.renderGone = true;
         if (pq.timer) {
           clearTimeout(pq.timer);
           pq.timer = null;
         }
-        pq.isPrinting = false;
+        // 关键修复：正在打印的任务必须走完成回调（从持久化中移除），
+        // 旧逻辑直接丢弃任务 → 残留在 pending-tasks.json → 每次启动重试 →
+        // 毒任务造成"启动即打印中→闪退"死循环
+        const task = pq.currentTask;
         pq.currentTask = null;
+        pq.isPrinting = false;
         pq.window = null;
+        pq.renderGone = true;
         // 销毁崩溃的窗口（可能已销毁，需 try-catch）
         try { win.destroy(); } catch (e) {}
-        // 延迟 1 秒后重新处理队列，避免崩溃循环
+        // 先设置冷却期，再走完成回调：onTaskDone 内部会触发 processNextTask，
+        // 由 pauseUntil 挡住，1 秒后由下面的定时器恢复，避免毒任务崩溃风暴
+        pq.pauseUntil = Date.now() + 1000;
+        if (task) {
+          try {
+            onTaskDone(name, task.taskId, task.socketId, task.templateId, false, "渲染进程崩溃");
+          } catch (err) {
+            logError("printWindow-render-gone-onTaskDone", err);
+          }
+        }
         setTimeout(() => {
           logInfo("printWindow-render-gone", `printer="${name}" 重新处理队列，剩余=${pq.queue.length}`);
+          pq.pauseUntil = 0;
           processNextTask(name);
         }, 1000);
         break;
@@ -442,35 +501,105 @@ function onTaskDone(printerName, taskId, socketId, templateId, success, reason) 
 
 /**
  * 从本地文件恢复未完成的任务到队列
- * 应用启动时调用
+ * 应用启动时由 main.js 在主窗口就绪后延迟调用（避免启动瞬间恢复任务触发闪退）
+ *
+ * 防护策略（防止缓存任务导致"启动即打印中→闪退"死循环）：
+ *   1. 丢弃超过 24 小时的过期任务
+ *   2. 丢弃重试次数达上限的"毒任务"（一渲染/打印就崩溃的 HTML/模板）
+ *   3. 丢弃数据不完整的任务
+ *   4. 单次最多恢复 MAX_RESTORE_TASKS 个，防止启动瞬间创建大量打印窗口
+ *   5. 恢复的任务 retryCount+1 并写回存储，连续崩溃 3 次后自动放弃
  */
 function restorePendingTasks() {
+  const info = store.getStoreInfo();
   const pendingTasks = store.getPendingTasks();
+  logInfo("restorePendingTasks-start", `持久化任务文件=${info.fileBytes}B 缓存任务总数=${pendingTasks.length}`);
+
   if (pendingTasks.length === 0) {
     return;
   }
 
-  console.log(`[store] 恢复 ${pendingTasks.length} 个未完成任务`);
+  // ---- 第一步：过滤过期 / 毒任务 / 无效任务 ----
+  const now = Date.now();
+  const valid = [];
+  let droppedAge = 0;
+  let droppedRetry = 0;
+  let droppedInvalid = 0;
+
+  pendingTasks.forEach((t) => {
+    try {
+      if (now - (t.createdAt || 0) > TASK_MAX_AGE_MS) {
+        droppedAge++;
+        store.removeTask(t.taskId);
+        return;
+      }
+      if ((t.retryCount || 0) >= MAX_TASK_RETRY) {
+        droppedRetry++;
+        store.removeTask(t.taskId);
+        return;
+      }
+      const hasHtml = typeof t.html === "string" && t.html.length > 0;
+      const hasTemplate = t.template && typeof t.template === "object";
+      if (!hasHtml && !hasTemplate) {
+        droppedInvalid++;
+        store.removeTask(t.taskId);
+        return;
+      }
+      valid.push(t);
+    } catch (err) {
+      logError("restorePendingTasks-filter", `taskId=${t.taskId} ${err.message}`);
+      store.removeTask(t.taskId);
+    }
+  });
+
+  if (droppedAge || droppedRetry || droppedInvalid) {
+    logInfo("restorePendingTasks-filter", `过期丢弃=${droppedAge} 毒任务丢弃=${droppedRetry} 无效丢弃=${droppedInvalid} 剩余=${valid.length}`);
+  }
+
+  // ---- 第二步：只恢复最新的 N 个，其余丢弃（防启动风暴） ----
+  let toRestore = valid;
+  if (valid.length > MAX_RESTORE_TASKS) {
+    valid.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+    const overflow = valid.slice(0, valid.length - MAX_RESTORE_TASKS);
+    toRestore = valid.slice(valid.length - MAX_RESTORE_TASKS);
+    overflow.forEach((t) => store.removeTask(t.taskId));
+    logInfo("restorePendingTasks-cap", `缓存任务过多，丢弃最旧 ${overflow.length} 个，仅恢复最新 ${MAX_RESTORE_TASKS} 个`);
+  }
 
   // 更新 taskId 计数器，避免与恢复的任务 ID 冲突
   let maxId = _taskIdCounter;
-  pendingTasks.forEach((t) => {
+  toRestore.forEach((t) => {
     if (t.taskId > maxId) {
       maxId = t.taskId;
     }
   });
   _taskIdCounter = maxId;
 
-  // 分为两类：有 html 的直接入打印队列，无 html 的需要重新渲染
+  // ---- 第三步：按能否直接打印分类 ----
   const printReady = [];
   const needRender = [];
 
-  pendingTasks.forEach((taskData) => {
+  toRestore.forEach((taskData) => {
     try {
       const printerName = taskData._resolvedPrinter || taskData.printer;
       if (!printerName) {
         store.removeTask(taskData.taskId);
         return;
+      }
+
+      // 恢复即重试：计数+1 写回存储，连续 MAX_TASK_RETRY 次失败后下次启动直接丢弃
+      taskData.retryCount = (taskData.retryCount || 0) + 1;
+      taskData._restored = true;
+      // 旧版本持久化的任务可能带非法 copies:0（Windows DEVMODE 要求>=1），
+      // 恢复路径不经过 enqueuePrintTask，必须在此归一化
+      if (!taskData.copies || taskData.copies < 1) {
+        taskData.copies = 1;
+      }
+      store.updateRetry(taskData.taskId, taskData.retryCount);
+
+      // news-server 任务的渲染参数存的是 params，index.html 用 data.data 渲染
+      if (taskData.data === undefined && taskData.params !== undefined) {
+        taskData.data = taskData.params;
       }
 
       if (taskData.html) {
@@ -485,9 +614,19 @@ function restorePendingTasks() {
       }
     } catch (err) {
       logError("restorePendingTasks-item", err);
-    // 单个任务异常不影响其他任务恢复
+      // 单个任务异常不影响其他任务恢复
     }
   });
+
+  // 关键：同步刷盘 retryCount！updateRetry 是 500ms 防抖写盘，
+  // 若任务在防抖窗口内把应用打崩，retryCount 永远不落盘 → 毒任务无限循环闪退。
+  // 这里在开始处理任何任务之前强制同步写盘，保证最多崩溃 MAX_TASK_RETRY 次后毒任务必被丢弃
+  try {
+    store.flushSave();
+    logInfo("restorePendingTasks-flush", `retryCount 已同步落盘（含重试计数的任务数=${printReady.length + needRender.length}）`);
+  } catch (err) {
+    logError("restorePendingTasks-flush", err);
+  }
 
   // 有 html 的任务直接入打印队列
   printReady.forEach((taskData) => {
@@ -500,7 +639,7 @@ function restorePendingTasks() {
 
   // 触发每个有任务的打印机开始处理
   // 启动时多个打印机并发处理可能同时创建多个窗口，对低内存机器冲击大
-  // 改为按打印机串行启动：每个打印机间隔 200ms，给系统喘息时间
+  // 改为按打印机串行启动：每个打印机间隔 500ms，给系统喘息时间
   const printersToStart = [];
   printerQueues.forEach((pq, printerName) => {
     if (pq.queue.length > 0) {
@@ -508,7 +647,7 @@ function restorePendingTasks() {
     }
   });
 
-  logInfo("restorePendingTasks-start", `待启动打印机数=${printersToStart.length} 待渲染任务=${needRender.length}`);
+  logInfo("restorePendingTasks-start-queues", `待启动打印机数=${printersToStart.length} 直接打印=${printReady.length} 待渲染任务=${needRender.length}`);
 
   printersToStart.forEach((name, idx) => {
     setTimeout(() => {
@@ -517,13 +656,13 @@ function restorePendingTasks() {
       } catch (err) {
         logError("restorePendingTasks-processNext", `printer="${name}" ${err.message}`);
       }
-    }, idx * 200);
+    }, idx * 500);
   });
 
   // 需要重新渲染的任务，延迟发送 getHtml（等 MAIN_WINDOW 加载完成）
   if (needRender.length > 0) {
     logInfo("restorePendingTasks-render", `${needRender.length} 个任务需要重新渲染模板`);
-    // 延迟 1.5 秒确保 MAIN_WINDOW 已加载 hiprint（启动恢复时主窗口可能仍在加载）
+    // 延迟 1.5 秒确保 MAIN_WINDOW 已加载 hiprint
     setTimeout(() => {
       needRender.forEach((taskData) => {
         try {
@@ -577,6 +716,95 @@ function flushPendingTasks() {
   if (store.flushSave) {
     store.flushSave();
   }
+}
+
+// ========== 看门狗（保活 + 运行时诊断日志） ==========
+
+/**
+ * 启动运行时看门狗：
+ * 1. 每 10 秒记录心跳日志：主进程内存(rss/heap/external)、待打印任务数、
+ *    打印窗口数、事件循环延迟（延迟过大即"无响应"的直接证据）
+ * 2. 每 60 秒记录一次 app.getAppMetrics()：每个进程的类型/PID/CPU/内存，
+ *    用于定位"哪个进程无响应/占用高"（应用正常就有 7~8 个进程）
+ * 3. 内存保护：超过告警阈值回收空闲打印窗口；超过危险阈值
+ *    持久化任务后 app.relaunch 自动重启（保活，防 OOM 闪退）
+ */
+let _watchdogStarted = false;
+function startWatchdog() {
+  if (_watchdogStarted) return;
+  _watchdogStarted = true;
+
+  let _lastTick = Date.now();
+  let _metricsCount = 0;
+
+  const tick = () => {
+    try {
+      const now = Date.now();
+      // 事件循环延迟 = 实际间隔 - 定时周期，若主进程被同步 IO/execSync 卡住会显著增大
+      const lag = Math.max(0, now - _lastTick - WATCHDOG_INTERVAL);
+      _lastTick = now;
+
+      const m = process.memoryUsage();
+      const pending = getTotalPendingCount();
+      const windows = countActiveWindows();
+      const line = `rss=${Math.round(m.rss / 1048576)}MB heap=${Math.round(m.heapUsed / 1048576)}/${Math.round(m.heapTotal / 1048576)}MB external=${Math.round(m.external / 1048576)}MB 待打印=${pending} 打印窗口=${windows} 事件循环延迟=${lag}ms`;
+
+      if (lag > EVENTLOOP_LAG_ALERT) {
+        // 主进程被阻塞（同步 IO/优先级抢占等），这是任务管理器"无响应"的直接证据
+        logError("watchdog-eventloop", `主进程阻塞 ${lag}ms（疑似无响应） ${line}`);
+      } else {
+        logInfo("watchdog-heartbeat", line);
+      }
+
+      // 每 6 个周期（约 60s）输出一次全部子进程的 CPU/内存快照
+      if (++_metricsCount >= 6) {
+        _metricsCount = 0;
+        try {
+          const metrics = app.getAppMetrics();
+          const parts = metrics.map(
+            (x) => `${x.type}#${x.pid} cpu=${x.cpu.percentCPUUsage.toFixed(1)}% mem=${Math.round(x.memory.workingSetSize / 1024)}MB`
+          );
+          logInfo("watchdog-metrics", `进程数=${metrics.length} ${parts.join(" | ")}`);
+        } catch (e) {
+          logError("watchdog-metrics", e);
+        }
+      }
+
+      // 内存保护：先回收空闲窗口，仍超危险阈值则保活重启
+      if (m.rss > MEM_CRITICAL_BYTES) {
+        logError("watchdog-memory-critical", `rss=${Math.round(m.rss / 1048576)}MB 超过临界值(${Math.round(MEM_CRITICAL_BYTES / 1048576)}MB)，持久化任务后自动重启应用（保活）`);
+        flushPendingTasks();
+        app.relaunch();
+        app.exit(1);
+        return;
+      }
+      if (m.rss > MEM_WARN_BYTES) {
+        logError("watchdog-memory-warn", `rss=${Math.round(m.rss / 1048576)}MB 超过告警值(${Math.round(MEM_WARN_BYTES / 1048576)}MB)，主动回收空闲打印窗口`);
+        printerQueues.forEach((pq, name) => {
+          if (pq.window && !pq.window.isDestroyed() && !pq.isPrinting && pq.queue.length === 0) {
+            try {
+              pq.window.destroy();
+            } catch (e) { /* 忽略销毁异常 */ }
+            pq.window = null;
+            if (pq.idleTimer) {
+              clearTimeout(pq.idleTimer);
+              pq.idleTimer = null;
+            }
+            logInfo("watchdog-memory-recycle", `printer="${name}" 空闲窗口已回收`);
+          }
+        });
+      }
+    } catch (err) {
+      logError("watchdog", err);
+    }
+  };
+
+  // 关键：立即执行第一次心跳！
+  // 闪退多发生在启动后 5~8 秒（恢复任务→渲染→打印），若第一个心跳等到 10 秒后，
+  // 崩溃时一条看门狗日志都没有，看起来就像"看门狗没工作"。
+  // 立即执行保证启动瞬间就有基线日志，之后每 10 秒一次
+  tick();
+  setInterval(tick, WATCHDOG_INTERVAL);
 }
 
 // ========== 托盘 ==========
@@ -890,6 +1118,24 @@ function initPrintEvent() {
         onTaskDone(printerName, data.taskId, data.socketId, data.templateId, false, "打印窗口已销毁");
         return;
       }
+      // 渲染进程已崩溃但窗口对象尚未销毁的中间态：此时调用 print 是
+      // Electron 13 已知的主进程硬崩溃点，必须先拦截
+      if (win.webContents.isCrashed()) {
+        onTaskDone(printerName, data.taskId, data.socketId, data.templateId, false, "打印窗口渲染进程已崩溃");
+        return;
+      }
+
+      // copies 归一化：0/负数是非法值（Windows DEVMODE.dmCopies 必须>=1），
+      // 某些打印机驱动收到非法 copies 会直接崩溃渲染进程甚至整个应用。
+      // 实测缓存任务里出现过 copies: 0
+      const copies = data.copies && data.copies > 0 ? Math.floor(data.copies) : 1;
+
+      // 打印参数快照（打印前最后一条日志，闪退时它就是崩溃点的前一刻）
+      logInfo(
+        "ipc-do-print",
+        `taskId=${data.taskId} deviceName="${deviceName}" copies=${copies} silent=${data.silent ?? true} pageSize=${data.pageSize ?? "默认"}`
+      );
+      flushLogs();
 
       win.webContents.print(
         {
@@ -904,7 +1150,7 @@ function initPrintEvent() {
           scaleFactor: data.scaleFactor ?? 100,
           pagesPerSheet: data.pagesPerSheet ?? 1,
           collate: data.collate ?? true,
-          copies: data.copies ?? 1,
+          copies: copies,
           pageRanges: data.pageRanges ?? {},
           duplexMode: data.duplexMode,
           dpi: data.dpi,
@@ -984,9 +1230,15 @@ module.exports = async () => {
   await initSocketIo();
   // 初始化打印事件
   initPrintEvent();
-  // 恢复未完成的任务
-  restorePendingTasks();
+  // 启动运行时看门狗（心跳日志/进程快照/内存保护/保活重启）
+  startWatchdog();
+  // 注意：restorePendingTasks 不在此处调用！
+  // 由 main.js 在主窗口 dom-ready 后延迟 3 秒调用：
+  // 旧逻辑在主窗口尚未渲染完成（打印机列表为空、进程仍在堆积）时立即恢复任务，
+  // 是"刚启动就显示打印中→闪退"的诱因之一
 };
 
 // 导出持久化方法供 main.js 在关闭前调用
 module.exports.flushPendingTasks = flushPendingTasks;
+// 导出任务恢复方法供 main.js 在主窗口就绪后延迟调用
+module.exports.restorePendingTasks = restorePendingTasks;

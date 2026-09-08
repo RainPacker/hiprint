@@ -269,6 +269,20 @@ async function createWindow() {
     setTimeout(() => {
       global.PROCESS_PRIORITY = setAllProcessesHighPriority();
     }, 3000);
+
+    // 延迟恢复未完成的打印任务：等主窗口渲染完成 + 3 秒缓冲再恢复，
+    // 避免启动瞬间（打印机列表未就绪、渲染进程还在堆积）恢复缓存任务导致闪退
+    // 恢复逻辑内部带有过期/毒任务/数量上限过滤（见 print.js restorePendingTasks）
+    setTimeout(() => {
+      try {
+        _diagLog("开始恢复持久化的打印任务");
+        printSetup.restorePendingTasks();
+        _diagLog("restorePendingTasks 完成");
+      } catch (err) {
+        logError("restorePendingTasks-main", err);
+        _diagLog(`restorePendingTasks 异常: ${err.message}`);
+      }
+    }, 3000);
   });
 
   // 仅在开发环境打开 DevTools
@@ -279,8 +293,31 @@ async function createWindow() {
   }
 
   // 渲染进程崩溃处理（WinServer 2025 上 GPU 兼容性可能导致崩溃）
+  // 保活策略：单次崩溃自动 reload；60 秒内崩溃 3 次说明页面本身有问题，
+  // 自动重启整个应用（app.relaunch），配合任务持久化实现断点续打
+  let _mainRenderCrashTimes = [];
   MAIN_WINDOW.webContents.on("render-process-gone", (event, details) => {
     logError("render-process-gone", `reason=${details.reason} exitCode=${details.exitCode}`);
+    const now = Date.now();
+    // 只统计最近 60 秒内的崩溃
+    _mainRenderCrashTimes = _mainRenderCrashTimes.filter((t) => now - t < 60000);
+    _mainRenderCrashTimes.push(now);
+
+    if (_mainRenderCrashTimes.length >= 3) {
+      logError("render-process-gone-relaunch", `60秒内主窗口渲染进程已崩溃 ${_mainRenderCrashTimes.length} 次，持久化任务后自动重启应用（保活）`);
+      _diagLog(`主窗口渲染进程 60 秒内崩溃 ${_mainRenderCrashTimes.length} 次，自动重启应用`);
+      try {
+        if (printSetup.flushPendingTasks) {
+          printSetup.flushPendingTasks();
+        }
+      } catch (err) {
+        logError("render-process-gone-flush", err);
+      }
+      app.relaunch();
+      app.exit(1);
+      return;
+    }
+
     // 尝试重新加载页面恢复
     try {
       if (!MAIN_WINDOW.isDestroyed()) {
@@ -317,9 +354,19 @@ async function createWindow() {
     }
   });
   // 打印相关
-  _diagLog("printSetup 开始（initTray + initSocketIo + initPrintEvent + restorePendingTasks）");
+  _diagLog("printSetup 开始（initTray + initSocketIo + initPrintEvent + 看门狗）");
   await printSetup();
-  _diagLog("printSetup 完成（托盘/socket/打印事件/任务恢复全部就绪）");
+  _diagLog("printSetup 完成（托盘/socket/打印事件/看门狗全部就绪，任务恢复延后至 dom-ready+3s）");
+
+  // 记录当前进程快照：正常应有 7~8 个进程
+  // (Main + GPU + Network + Utility + Crashpad + 主窗口Renderer + 打印窗口Renderer...)
+  // 后续由 print.js 看门狗每 60 秒记录各进程 CPU/内存到 logs/crash-*.log
+  try {
+    const metrics = app.getAppMetrics();
+    _diagLog(`进程快照 共${metrics.length}个: ${metrics.map((m) => `${m.type}#${m.pid}`).join(", ")}`);
+  } catch (e) {
+    _diagLog(`获取进程快照失败: ${e.message}`);
+  }
 
   // 启动定时内存监控，捕获内存泄漏导致闪退
   const _initMem = process.memoryUsage();
