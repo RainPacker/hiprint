@@ -30,7 +30,9 @@ const IDLE_WINDOW_TIMEOUT = 60000;
 const MIN_KEEP_WINDOWS = 1;
 // 单个窗口最大复用次数，超过后强制销毁重建，避免渲染进程内存累积导致硬崩溃
 // 渲染进程长期不重启会累积 hiprint 状态/内存碎片，最终可能在 IPC send 时引发底层崩溃
-const MAX_WINDOW_REUSE = 50;
+// 2026-09-12 崩溃复盘：两次主进程硬崩溃均发生在同一打印窗口第 4 次复用、
+// 与 Windows spooler 交互期间；50 次过于宽松，收紧到 20，重建成本远低于一次闪退
+const MAX_WINDOW_REUSE = 20;
 
 // ========== 启动恢复防护（防止缓存任务导致"启动即打印中→闪退"死循环） ==========
 // 单个任务最大重试次数：超过视为"毒任务"（一渲染/打印就崩溃），启动恢复时直接丢弃
@@ -462,7 +464,15 @@ function onTaskDone(printerName, taskId, socketId, templateId, success, reason) 
   }
 
   // 持久化：任务完成，从本地文件中移除
+  // removeTask 是 500ms 防抖落盘：若主进程在防抖窗口内崩溃（驱动层硬崩溃），
+  // 已打印成功的任务仍在缓存文件里，下次启动会被恢复重打 → 重复出纸。
+  // 任务完成是低频事件，此处同步刷盘彻底消除该风险
   store.removeTask(taskId);
+  try {
+    store.flushSave();
+  } catch (err) {
+    logError("onTaskDone-flush", err);
+  }
 
   pq.isPrinting = false;
   pq.currentTask = null; // 清除当前任务引用
