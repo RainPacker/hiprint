@@ -10,10 +10,13 @@
 //   3. 用户托盘"退出"时写标记，应用启动时清除标记（恢复保活）
 // 计划任务注册/脚本生成均在应用侧完成，重新注册（/F 覆盖）可自愈 exe 路径变化
 
-const { execFileSync } = require("child_process");
+const { execFile } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const { app } = require("electron");
+
+// schtasks 调用超时（毫秒）
+const SCHTASKS_TIMEOUT_MS = 20000;
 
 // 计划任务名称（注册表/任务计划程序中显示的名字）
 const TASK_NAME = "electron-hiprint-keepalive";
@@ -225,24 +228,41 @@ function writeTaskXml() {
 }
 
 /**
- * 执行 schtasks 命令（同步，注册/查询/删除均为一次性低频操作）
+ * 执行 schtasks 命令（异步，不阻塞主进程事件循环）
+ * 2026-09-15 WinServer 2019 复盘：原实现用 execFileSync，该服务器 schtasks 响应极慢
+ * （Task Scheduler 服务拥塞，8 次调用全部 ETIMEDOUT），同步等待期间主进程完全冻结
+ * 12~20 秒——socket 心跳超时掉线重连、打印队列停摆、托盘 UI 无响应
+ * （watchdog-eventloop 记录到 16575/12217/19492/14189ms 阻塞）。
+ * 改用异步 execFile 后，schtasks 挂起只影响本次操作本身，主进程照常处理打印/心跳。
+ * @param {string[]} args - schtasks 参数
+ * @returns {Promise<string>} stdout
  */
 function runSchtasks(args) {
-  return execFileSync("schtasks", args, {
-    windowsHide: true,
-    timeout: 20000,
-    encoding: "utf-8",
+  return new Promise((resolve, reject) => {
+    execFile(
+      "schtasks",
+      args,
+      { windowsHide: true, timeout: SCHTASKS_TIMEOUT_MS, encoding: "utf-8" },
+      (err, stdout, stderr) => {
+        if (err) {
+          if (stderr) err.stderr = stderr;
+          reject(err);
+        } else {
+          resolve(stdout);
+        }
+      }
+    );
   });
 }
 
 /**
- * 查询计划任务是否已注册
- * @returns {boolean}
+ * 查询计划任务是否已注册（异步）
+ * @returns {Promise<boolean>}
  */
-function isRegistered() {
+async function isRegistered() {
   if (process.platform !== "win32") return false;
   try {
-    runSchtasks(["/Query", "/TN", TASK_NAME]);
+    await runSchtasks(["/Query", "/TN", TASK_NAME]);
     return true;
   } catch (e) {
     return false;
@@ -252,9 +272,9 @@ function isRegistered() {
 /**
  * 注册（或覆盖重建）保活计划任务。每次应用启动调用一次：
  * /F 覆盖语义同时可自愈 exe 路径变化（升级安装后路径/版本号变化）
- * @throws {Error} 注册失败时抛出（含 schtasks stderr）
+ * @returns {Promise<void>} 注册失败时 reject（含 schtasks stderr）
  */
-function register() {
+async function register() {
   if (process.platform !== "win32") {
     throw new Error("外部保活仅支持 Windows 平台");
   }
@@ -262,7 +282,7 @@ function register() {
   writeKeepAliveVbs();
   writeTaskXml();
   try {
-    runSchtasks(["/Create", "/F", "/TN", TASK_NAME, "/XML", getXmlPath()]);
+    await runSchtasks(["/Create", "/F", "/TN", TASK_NAME, "/XML", getXmlPath()]);
   } catch (e) {
     const detail = (e.stderr || e.message || "").trim();
     log("keepalive-register", `注册计划任务失败: ${detail}`, true);
@@ -274,12 +294,14 @@ function register() {
 }
 
 /**
- * 注销保活计划任务（托盘关闭开关时调用），幂等
+ * 注销保活计划任务（托盘关闭开关时调用），幂等。
+ * 任何失败（任务不存在/schtasks 超时）都不 reject——注销失败不影响应用运行
+ * @returns {Promise<void>}
  */
-function unregister() {
+async function unregister() {
   if (process.platform !== "win32") return;
   try {
-    runSchtasks(["/Delete", "/F", "/TN", TASK_NAME]);
+    await runSchtasks(["/Delete", "/F", "/TN", TASK_NAME]);
     log("keepalive-unregister", `计划任务 "${TASK_NAME}" 已注销`);
   } catch (e) {
     // 任务不存在时 schtasks 返回非 0，属正常情况，不算错误
@@ -290,24 +312,27 @@ function unregister() {
 /**
  * 应用启动时初始化外部保活：
  * 1. 清除优雅退出标记（用户手动启动 = 恢复保活意愿）
- * 2. 按配置注册或注销计划任务
+ * 2. 按配置注册或注销计划任务（异步，不阻塞窗口创建）
  * @param {boolean} enabled - 配置项 keepAlive
+ * @returns {Promise<boolean>} 任务最终注册状态（注册成功为 true，其余为 false）
  */
-function init(enabled) {
+async function init(enabled) {
   if (process.platform !== "win32") {
     log("keepalive-init", "非 Windows 平台，跳过外部保活");
-    return;
+    return false;
   }
   clearGracefulExit();
   try {
     if (enabled) {
-      register();
-    } else {
-      unregister();
+      await register();
+      return true;
     }
+    await unregister();
+    return false;
   } catch (err) {
     // 注册失败不影响应用启动（如域策略禁止创建计划任务）
     log("keepalive-init", `初始化失败: ${err.message}`, true);
+    return false;
   }
 }
 

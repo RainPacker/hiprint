@@ -127,7 +127,9 @@ function addTask(data) {
     // 重试计数：用于识别"毒任务"（一渲染/打印就崩溃），超过次数上限后启动时丢弃
     retryCount: data.retryCount || 0,
     status: "pending",
-    createdAt: Date.now(),
+    // 保留原始创建时间：restorePendingTasks 换 taskId 重存时不能"续命"，
+    // 否则 24 小时过期过滤永远不生效（与 saveAllTasks 行为一致）
+    createdAt: data.createdAt || Date.now(),
   };
   tasks.push(storeData);
   // 超上限时丢弃最旧的任务，防止持久化文件无限膨胀

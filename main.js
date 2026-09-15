@@ -176,12 +176,31 @@ async function initialize() {
     _diagLog("setAutoLaunch 完成");
     // 外部保活：Windows 计划任务每分钟检查进程，闪退/被杀后自动拉起
     // （内部含清除"优雅退出"标记：用户手动启动应用即恢复保活意愿）
+    // 2026-09-15 WinServer 2019 复盘：schtasks 在该服务器上响应极慢（Task Scheduler
+    // 服务拥塞），同步调用会冻结主进程最长 20 秒（socket 掉线/队列停摆/UI 无响应），
+    // 已改为异步执行，注册结果回调时再更新托盘菜单勾选状态
     try {
       keepalive.setLogger(logInfo, logError);
       const savedKeepAlive = getConfig("keepAlive", true);
       _diagLog(`getConfig keepAlive=${savedKeepAlive}`);
-      keepalive.init(savedKeepAlive);
-      global.KEEPALIVE_ENABLED = savedKeepAlive && keepalive.isRegistered();
+      keepalive
+        .init(savedKeepAlive)
+        .then((registered) => {
+          global.KEEPALIVE_ENABLED = savedKeepAlive && registered;
+          _diagLog(`keepalive init 完成 registered=${registered}`);
+          // 托盘可能已创建（托盘初始化早于本次异步注册完成），同步勾选状态
+          try {
+            if (printSetup.refreshTrayMenu) {
+              printSetup.refreshTrayMenu();
+            }
+          } catch (err) {
+            logError("keepalive-refreshTray", err);
+          }
+        })
+        .catch((err) => {
+          logError("keepalive-init", err);
+          _diagLog(`keepalive 初始化异常: ${err.message}`);
+        });
     } catch (err) {
       logError("keepalive-init", err);
       _diagLog(`keepalive 初始化异常: ${err.message}`);

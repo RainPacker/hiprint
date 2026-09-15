@@ -65,6 +65,12 @@ const printerQueues = new Map();
 // key: taskId, value: { data, socketId, timer }
 const renderingTasks = new Map();
 
+// keepalive 计划任务注册/注销进行中标志（防托盘菜单连点导致并发 schtasks）
+let _keepaliveBusy = false;
+
+// 托盘菜单构建函数（initTray 内定义，模块级引用供 refreshTrayMenu 使用）
+let _buildTrayMenu = null;
+
 /**
  * 获取或创建指定打印机的队列
  */
@@ -594,14 +600,27 @@ function restorePendingTasks() {
     logInfo("restorePendingTasks-cap", `缓存任务过多，丢弃最旧 ${overflow.length} 个，仅恢复最新 ${MAX_RESTORE_TASKS} 个`);
   }
 
-  // 更新 taskId 计数器，避免与恢复的任务 ID 冲突
-  let maxId = _taskIdCounter;
+  // ---- 为恢复任务重新分配本实例唯一的 taskId ----
+  // 2026-09-15 WinServer 2019 复盘：历史持久化文件存在跨实例重复 ID（每个实例的
+  // 计数器都从 1 开始重新计数），且启动早期 socket 任务可能已占用低 ID。
+  // 重复 ID 的后果链（日志实锤）：恢复的 taskId=1 与队列中已完成任务撞号 →
+  // onTaskDone 的 lastDoneTaskId 防重入把超时回调当"迟到回调"拦截 →
+  // 任务不移除、isPrinting 不复位、processNextTask 不触发 → 队列永久卡死
+  // （"待打印=2 打印窗口=0"静止 9 分钟，直到进程崩溃才解脱）。
+  // 重新分配新 ID 彻底根治：本实例内 taskId 全局唯一，旧 ID 仅记日志排查用。
+  // 注：removeTask 按 ID filter，会连带删除同旧 ID 的其他待恢复记录——无妨，
+  // 它们随后也会以各自的新 ID 重新 addTask 入库。
+  const reidMap = [];
   toRestore.forEach((t) => {
-    if (t.taskId > maxId) {
-      maxId = t.taskId;
-    }
+    const oldId = t.taskId;
+    store.removeTask(oldId);
+    t.taskId = nextTaskId();
+    reidMap.push(`${oldId}→${t.taskId}`);
+    store.addTask(t);
   });
-  _taskIdCounter = maxId;
+  if (toRestore.length > 0) {
+    logInfo("restorePendingTasks-reid", `已为 ${toRestore.length} 个恢复任务重新分配 taskId: ${reidMap.join(", ")}`);
+  }
 
   // ---- 第三步：按能否直接打印分类 ----
   const printReady = [];
@@ -877,26 +896,42 @@ async function initTray() {
         visible: process.platform === "win32",
         click: (menuItem) => {
           const keepalive = require("./keepalive");
-          try {
-            if (menuItem.checked) {
-              keepalive.register();
-            } else {
-              keepalive.unregister();
-            }
-            global.KEEPALIVE_ENABLED = menuItem.checked;
-            // 持久化用户选择，重启后记住配置
-            saveConfig("keepAlive", menuItem.checked);
-            // 通知页面更新显示
-            safeSendToMain("keepaliveStatus", menuItem.checked);
-            logInfo("tray-keepalive", `外部保活(计划任务)已${menuItem.checked ? "开启" : "关闭"}`);
-          } catch (err) {
-            // 注册失败（如域策略限制），回退勾选状态
-            menuItem.checked = !menuItem.checked;
-            global.KEEPALIVE_ENABLED = menuItem.checked;
-            logError("tray-keepalive", err);
+          const enable = menuItem.checked;
+          // 防连点：上一次注册/注销还在执行（schtasks 挂起最长 20 秒），
+          // 忽略本次点击并回退勾选状态，避免并发 schtasks
+          if (_keepaliveBusy) {
+            menuItem.checked = !enable;
+            APP_TRAY.setContextMenu(Menu.buildFromTemplate(buildTrayMenu()));
+            return;
           }
-          // 重建菜单以更新勾选状态
-          APP_TRAY.setContextMenu(Menu.buildFromTemplate(buildTrayMenu()));
+          _keepaliveBusy = true;
+          // 2026-09-15 WinServer 2019 复盘：register/unregister 已改为异步。
+          // 旧版同步 execFileSync 在 schtasks 挂起时冻结主进程 12~20 秒
+          // （用户每点一次菜单 UI 就卡死一次，日志 4 次堆栈铁证）
+          const finish = (ok) => {
+            _keepaliveBusy = false;
+            if (ok) {
+              global.KEEPALIVE_ENABLED = enable;
+              // 持久化用户选择，重启后记住配置
+              saveConfig("keepAlive", enable);
+              // 通知页面更新显示
+              safeSendToMain("keepaliveStatus", enable);
+              logInfo("tray-keepalive", `外部保活(计划任务)已${enable ? "开启" : "关闭"}`);
+            } else {
+              // 注册失败（schtasks 超时/域策略限制），回退勾选状态
+              menuItem.checked = !enable;
+              global.KEEPALIVE_ENABLED = !enable;
+            }
+            // 重建菜单以更新勾选状态
+            APP_TRAY.setContextMenu(Menu.buildFromTemplate(buildTrayMenu()));
+          };
+          const op = enable ? keepalive.register() : keepalive.unregister();
+          op
+            .then(() => finish(true))
+            .catch((err) => {
+              logError("tray-keepalive", err);
+              finish(false);
+            });
         },
       },
       { type: "separator" },
@@ -921,6 +956,9 @@ async function initTray() {
     ];
     return trayMenuTemplate;
   }
+
+  // 挂到模块级引用，供 refreshTrayMenu（keepalive 异步注册完成后）重建菜单
+  _buildTrayMenu = buildTrayMenu;
 
   const contextMenu = Menu.buildFromTemplate(buildTrayMenu());
   APP_TRAY.setContextMenu(contextMenu);
@@ -1306,3 +1344,14 @@ module.exports = async () => {
 module.exports.flushPendingTasks = flushPendingTasks;
 // 导出任务恢复方法供 main.js 在主窗口就绪后延迟调用
 module.exports.restorePendingTasks = restorePendingTasks;
+// 供 main.js 在 keepalive 异步注册完成后刷新托盘勾选状态
+// （init 为异步，托盘创建时注册可能尚未完成，勾选状态需事后同步）
+module.exports.refreshTrayMenu = function () {
+  try {
+    if (APP_TRAY && !APP_TRAY.isDestroyed() && _buildTrayMenu) {
+      APP_TRAY.setContextMenu(Menu.buildFromTemplate(_buildTrayMenu()));
+    }
+  } catch (err) {
+    logError("tray-refresh", err);
+  }
+};
