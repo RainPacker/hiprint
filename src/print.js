@@ -80,6 +80,7 @@ function getPrinterQueue(printerName) {
       reuseCount: 0,   // 当前窗口已复用打印次数
       renderGone: false, // 渲染进程是否已崩溃
       pauseUntil: 0,   // 队列暂停截止时间戳（渲染崩溃后冷却）
+      lastDoneTaskId: null, // 最后一次完成任务的任务 ID（丢弃迟到回调）
     });
   }
   return printerQueues.get(printerName);
@@ -194,6 +195,15 @@ function processNextTask(printerName) {
   // 超时保护
   pq.timer = setTimeout(() => {
     logError("print-timeout", `taskId=${data.taskId} printer="${printerName}" 超时(${TASK_TIMEOUT}ms)`);
+    // 超时窗口已不可信：要么 print-new 丢失（渲染端无响应），要么 print() 回调挂起
+    // （spooler/驱动停摆）。保留它会让后续任务在坏窗口上连环挂起，销毁重建。
+    // 2026-09-14 日志：10 例 print() 挂起型超时后，同一窗口继续接任务
+    if (pq.window && !pq.window.isDestroyed()) {
+      logInfo("print-timeout", `printer="${printerName}" 销毁挂起窗口，下个任务将新建窗口`);
+      try { pq.window.destroy(); } catch (e) {}
+    }
+    pq.window = null;
+    pq.renderGone = false;
     onTaskDone(printerName, data.taskId, data.socketId, data.templateId, false, "打印超时");
   }, TASK_TIMEOUT);
 
@@ -440,6 +450,14 @@ function ensurePrinterWindow(printerName) {
  */
 function onTaskDone(printerName, taskId, socketId, templateId, success, reason) {
   const pq = getPrinterQueue(printerName);
+
+  // 防重入：超时路径销毁窗口后，Chromium 取消打印作业可能触发迟到的 print() 回调，
+  // 该任务已按超时处理过，二次回调会导致 socket 双重通知（error 后又发 success）
+  if (pq.lastDoneTaskId === taskId) {
+    logInfo("onTaskDone-dup", `taskId=${taskId} 已完成过，丢弃迟到回调 success=${success}`);
+    return;
+  }
+  pq.lastDoneTaskId = taskId;
 
   logInfo("onTaskDone", `taskId=${taskId} printer="${printerName}" success=${success} reason="${reason || ""}"`);
 
