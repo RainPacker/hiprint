@@ -247,13 +247,14 @@ function safeSendToMain(channel, ...args) {
 }
 
 /**
- * 安全地获取打印机列表
- * @returns {Array} 打印机列表，失败返回空数组
+ * 安全地获取打印机列表（异步）
+ * Electron 44 移除了同步的 webContents.getPrinters()，必须使用 getPrintersAsync()
+ * @returns {Promise<Array>} 打印机列表，失败返回空数组
  */
-function safeGetPrinters() {
+async function safeGetPrinters() {
   try {
     if (isMainWindowAvailable()) {
-      const printers = MAIN_WINDOW.webContents.getPrinters();
+      const printers = await MAIN_WINDOW.webContents.getPrintersAsync();
       logInfo("safeGetPrinters", `获取到 ${printers.length} 台打印机`);
       return printers;
     } else {

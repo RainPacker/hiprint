@@ -108,8 +108,8 @@ function getTotalPendingCount() {
  * 如果指定的打印机不存在，回退到默认打印机
  * WinServer 启动时 Print Spooler 可能未就绪，返回空列表需安全处理
  */
-function resolvePrinterName(requestedPrinter) {
-  const printers = safeGetPrinters();
+async function resolvePrinterName(requestedPrinter) {
+  const printers = await safeGetPrinters();
   if (!printers || printers.length === 0) {
     // 打印机列表为空（Spooler 未就绪），返回原始请求名，后续打印时会失败但不崩溃
     logError("resolvePrinterName", "打印机列表为空，Print Spooler 可能未就绪");
@@ -131,14 +131,14 @@ function resolvePrinterName(requestedPrinter) {
 /**
  * 将打印任务加入对应打印机的队列
  */
-function enqueuePrintTask(data) {
+async function enqueuePrintTask(data) {
   // news-server 已在入队前分配了 taskId，不要覆盖
   if (!data.taskId) {
     data.taskId = nextTaskId();
   }
 
   // 解析实际打印机名称
-  const printerName = resolvePrinterName(data.printer);
+  const printerName = await resolvePrinterName(data.printer);
   data.printer = printerName;
   data._resolvedPrinter = printerName;
 
@@ -982,14 +982,17 @@ async function initSocketIo() {
     socketList = [];
     socketStore[client.id] = client;
     logInfo("socket-connection", `client.id=${client.id} 当前连接数=${Object.keys(socketStore).length}`);
-    client.emit("printerList", safeGetPrinters());
-    client.on("news", (data) => {
+    // safeGetPrinters 是异步的（Electron 44 getPrintersAsync）
+    safeGetPrinters().then((printers) => {
+      try { client.emit("printerList", printers); } catch (e) { /* 客户端可能已断开 */ }
+    });
+    client.on("news", async (data) => {
       try {
         logInfo("socket-news-recv", `client.id=${client.id} printer="${data && data.printer}" templateId=${data && data.templateId} htmlLen=${data && data.html ? data.html.length : 0} copies=${data && data.copies} preview=${truncateForLog(data && data.html, 200)}`);
         if (data && data.html) {
           data.printer = data.printer;
           data.socketId = client.id;
-          enqueuePrintTask(data);
+          await enqueuePrintTask(data);
         } else {
           logError("socket-news-invalid", `client.id=${client.id} 数据缺少 html 字段`);
         }
@@ -1041,10 +1044,11 @@ async function initSocketIo() {
       }
     });
     // 刷新打印机列表
-    client.on("refreshPrinterList", (data) => {
+    client.on("refreshPrinterList", async (data) => {
       try {
         logInfo("socket-refreshPrinterList-recv", `client.id=${client.id}`);
-        client.emit("printerList", safeGetPrinters());
+        const printers = await safeGetPrinters();
+        client.emit("printerList", printers);
       } catch (err) {
         logError("socket-refreshPrinterList", err);
       }
@@ -1190,7 +1194,7 @@ async function initSocketIo() {
 
 // ========== 打印事件 ==========
 function initPrintEvent() {
-  ipcMain.on("do", (event, data) => {
+  ipcMain.on("do", async (event, data) => {
     try {
       const printerName = data._resolvedPrinter || data.printer;
       logInfo("ipc-do-recv", `taskId=${data.taskId} printer="${printerName}" copies=${data.copies || 1} silent=${data.silent ?? true}`);
@@ -1202,7 +1206,8 @@ function initPrintEvent() {
         return;
       }
 
-      const printers = win.webContents.getPrinters();
+      // Electron 44：getPrinters() 已移除，改用 getPrintersAsync()
+      const printers = await win.webContents.getPrintersAsync();
       let havePrinter = false;
       let defaultPrinter = "";
       printers.forEach((element) => {
@@ -1284,7 +1289,7 @@ function initPrintEvent() {
   });
 
   // 收到 UI 给的 html 代码（news-server 渲染完成后回调）
-  ipcMain.on("htmlPrint", (event, data) => {
+  ipcMain.on("htmlPrint", async (event, data) => {
     try {
       logInfo("ipc-htmlPrint-recv", `taskId=${data.taskId} printer="${data.printer}" templateId=${data.templateId} htmlLen=${data.html ? data.html.length : 0} htmlPreview=${truncateForLog(data.html, 200)}`);
       if (data && data.html) {
@@ -1295,7 +1300,7 @@ function initPrintEvent() {
           renderingTasks.delete(data.taskId);
         }
         data.printer = data.printer;
-        enqueuePrintTask(data);
+        await enqueuePrintTask(data);
       }
     } catch (err) {
       logError("ipcMain-htmlPrint", err);
