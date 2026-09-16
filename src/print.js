@@ -1233,9 +1233,16 @@ function initPrintEvent() {
       const copies = data.copies && data.copies > 0 ? Math.floor(data.copies) : 1;
 
       // 打印参数快照（打印前最后一条日志，闪退时它就是崩溃点的前一刻）
+      // pageSize 可能是对象（如 {width,height}）也可能是字符串，统一序列化避免 [object Object]
+      const pageSizeDesc =
+        data.pageSize == null
+          ? "默认"
+          : typeof data.pageSize === "string"
+            ? data.pageSize
+            : JSON.stringify(data.pageSize);
       logInfo(
         "ipc-do-print",
-        `taskId=${data.taskId} deviceName="${deviceName}" copies=${copies} silent=${data.silent ?? true} pageSize=${data.pageSize ?? "默认"}`
+        `taskId=${data.taskId} deviceName="${deviceName}" copies=${copies} silent=${data.silent ?? true} pageSize=${pageSizeDesc}`
       );
       flushLogs();
 
