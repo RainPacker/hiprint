@@ -33,7 +33,7 @@ function _startMemMonitor() {
 // 注意：不手动启动 crashReporter，Electron 打包应用默认已内置 Crashpad 崩溃捕获
 // 手动调用 crashReporter.start() 在打包模式下会触发 native 崩溃
 
-const { app, BrowserWindow, BrowserView, ipcMain, Menu } = require("electron");
+const { app, BrowserWindow, WebContentsView, ipcMain, Menu } = require("electron");
 _diagLog("require(electron) 完成");
 
 const path = require("path");
@@ -410,9 +410,10 @@ async function createWindow() {
 
 // 加载等待页面
 async function loadingView(windowOptions) {
-  const loadingBrowserView = new BrowserView();
-  MAIN_WINDOW.setBrowserView(loadingBrowserView);
-  loadingBrowserView.setBounds({
+  // Electron 30+ BrowserView 已废弃，改用 WebContentsView（View 体系）
+  const loadingOverlay = new WebContentsView();
+  MAIN_WINDOW.contentView.addChildView(loadingOverlay);
+  loadingOverlay.setBounds({
     x: 0,
     y: 0,
     width: windowOptions.width,
@@ -420,23 +421,23 @@ async function loadingView(windowOptions) {
   });
 
   const loadingHtml = path.join(__dirname, "/assets/loading.html");
-  loadingBrowserView.webContents.loadURL("file://" + loadingHtml);
+  loadingOverlay.webContents.loadURL("file://" + loadingHtml);
 
   // 使用 once 避免重复触发，添加销毁检查
   MAIN_WINDOW.webContents.once("dom-ready", async (event) => {
     try {
       if (!MAIN_WINDOW.isDestroyed()) {
-        MAIN_WINDOW.removeBrowserView(loadingBrowserView);
+        MAIN_WINDOW.contentView.removeChildView(loadingOverlay);
       }
     } catch (err) {
       logError("loadingView-remove", err);
     }
-    // 延迟销毁 webContents，避免在 dom-ready 回调中立即销毁影响主窗口渲染
+    // 延迟关闭 webContents，避免在 dom-ready 回调中立即销毁影响主窗口渲染
     // 导致 loading 动画残留与主页面同时显示
     setTimeout(() => {
       try {
-        if (loadingBrowserView.webContents && !loadingBrowserView.webContents.isDestroyed()) {
-          loadingBrowserView.webContents.destroy();
+        if (loadingOverlay.webContents && !loadingOverlay.webContents.isDestroyed()) {
+          loadingOverlay.webContents.close();
         }
       } catch (e) { /* 忽略销毁异常 */ }
     }, 2000);
