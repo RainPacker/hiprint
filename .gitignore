@@ -18,9 +18,15 @@ package-lock.json
 run/
 out/
 .history/
+<<<<<<< HEAD
 
 # electron 二进制缓存（npm 安装时重定向到项目目录）
 .electron-cache/
 
 # electron-builder 工具链缓存（nsis 等）
 .electron-builder-cache/
+=======
+.electron-builder-cache/
+.electron-cache/
+
+>>>>>>> 28f277e (chore(gitignore): add electron cache directories to ignore)
