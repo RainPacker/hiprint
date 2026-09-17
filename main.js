@@ -42,6 +42,7 @@ const helper = require("./src/helper");
 const { logError, logInfo, flushLogs, cleanupOldLogs, saveConfig, getConfig, setProcessHighPriority, setAllProcessesHighPriority } = helper;
 const printSetup = require("./src/print");
 const keepalive = require("./src/keepalive");
+const feishu = require("./src/feishu");
 const address = require("address");
 _diagLog("业务模块 require 完成（helper, print, address, http, socket.io 待创建）");
 
@@ -208,6 +209,15 @@ async function initialize() {
     // 创建浏览器窗口
     createWindow();
     _diagLog("createWindow 已调用（异步执行中）");
+
+    // 飞书异常通知：脏标记检测（上次实例异常退出 → 本次被保活/自启拉起 → 延迟发送告警）
+    // 内部会立即写入本实例运行标记；崩溃路径不会清标记，下次启动即可检测到
+    try {
+      feishu.checkStartupCrash(process.argv.includes("--hidden"));
+    } catch (err) {
+      logError("feishu-startup", err);
+      _diagLog(`feishu 启动检测异常: ${err.message}`);
+    }
     app.on("activate", function() {
       if (BrowserWindow.getAllWindows().length === 0) {
         createWindow();
@@ -232,6 +242,13 @@ async function initialize() {
     _diagLog("before-quit 触发（应用即将退出）");
     if (printSetup.flushPendingTasks) {
       printSetup.flushPendingTasks();
+    }
+    // 优雅退出：清除运行标记（下次启动不误报"异常退出"）。
+    // 注意 app.exit()（OOM 保活重启）不触发 before-quit，其标记由 feishu.notifyOOMRestart 处理
+    try {
+      feishu.clearRunningMarker();
+    } catch (err) {
+      logError("feishu-before-quit", err);
     }
   });
   app.on("will-quit", () => _diagLog("will-quit 触发"));

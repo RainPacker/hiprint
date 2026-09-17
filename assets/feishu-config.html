@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>飞书异常通知设置</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+      font-size: 13px;
+      color: #333;
+      background: #f5f6f8;
+      padding: 18px 20px;
+    }
+    .form-item { margin-bottom: 14px; }
+    label { display: block; margin-bottom: 6px; font-weight: bold; color: #3370ff; }
+    input[type="text"] {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #d5d9e0;
+      border-radius: 4px;
+      font-size: 13px;
+      outline: none;
+    }
+    input[type="text"]:focus { border-color: #3370ff; }
+    .hint { color: #8f959e; font-size: 12px; line-height: 1.7; margin-top: 8px; }
+    .btns { display: flex; gap: 10px; margin-top: 4px; }
+    button {
+      flex: 1;
+      padding: 8px 0;
+      border: none;
+      border-radius: 4px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .btn-save { background: #3370ff; color: #fff; }
+    .btn-test { background: #fff; color: #3370ff; border: 1px solid #3370ff !important; }
+    #status {
+      margin-top: 12px;
+      min-height: 18px;
+      font-size: 12px;
+      line-height: 1.6;
+      word-break: break-all;
+    }
+    #status.ok { color: #2eaa49; }
+    #status.err { color: #f54a45; }
+  </style>
+</head>
+<body>
+  <div class="form-item">
+    <label>飞书自定义机器人 Webhook 地址</label>
+    <input type="text" id="webhook" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx" spellcheck="false" />
+    <div class="hint">
+      通知场景：应用异常退出（崩溃/被杀/内存超限自动重启）后被保活拉起时推送告警；用户正常退出不通知。
+      10 分钟内多次异常只发一条（附带抑制次数）。留空则不发送任何通知。
+    </div>
+  </div>
+  <div class="btns">
+    <button class="btn-save" id="btnSave">保存</button>
+    <button class="btn-test" id="btnTest">发送测试</button>
+  </div>
+  <div id="status"></div>
+
+  <script>
+    const { ipcRenderer } = require("electron");
+    const $ = (id) => document.getElementById(id);
+
+    function setStatus(msg, cls) {
+      $("status").textContent = msg;
+      $("status").className = cls || "";
+    }
+
+    window.onload = async () => {
+      try {
+        const saved = await ipcRenderer.invoke("feishu-config-get");
+        $("webhook").value = saved || "";
+      } catch (e) {
+        setStatus("读取配置失败: " + e.message, "err");
+      }
+    };
+
+    $("btnSave").onclick = async () => {
+      const url = $("webhook").value.trim();
+      $("btnSave").disabled = true;
+      try {
+        const r = await ipcRenderer.invoke("feishu-config-save", url);
+        setStatus(r.ok ? "已保存" : "保存失败: " + r.msg, r.ok ? "ok" : "err");
+      } catch (e) {
+        setStatus("保存失败: " + e.message, "err");
+      } finally {
+        $("btnSave").disabled = false;
+      }
+    };
+
+    $("btnTest").onclick = async () => {
+      const url = $("webhook").value.trim();
+      if (!url) {
+        setStatus("请先填写 webhook 地址", "err");
+        return;
+      }
+      $("btnTest").disabled = true;
+      setStatus("发送中...");
+      try {
+        const r = await ipcRenderer.invoke("feishu-test", url);
+        setStatus(r.ok ? "测试消息已发送，请到飞书群查收" : "发送失败: " + r.msg, r.ok ? "ok" : "err");
+      } catch (e) {
+        setStatus("发送失败: " + e.message, "err");
+      } finally {
+        $("btnTest").disabled = false;
+      }
+    };
+  </script>
+</body>
+</html>
