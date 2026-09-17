@@ -68,6 +68,9 @@ const renderingTasks = new Map();
 // keepalive 计划任务注册/注销进行中标志（防托盘菜单连点导致并发 schtasks）
 let _keepaliveBusy = false;
 
+// OOM 保活重启进行中标志：飞书通知发送窗口内不再重复触发重启流程
+let _oomRestarting = false;
+
 // 托盘菜单构建函数（initTray 内定义，模块级引用供 refreshTrayMenu 使用）
 let _buildTrayMenu = null;
 
@@ -785,6 +788,8 @@ function startWatchdog() {
   let _metricsCount = 0;
 
   const tick = () => {
+    // OOM 重启流程进行中（飞书通知发送窗口），跳过后续心跳逻辑等待重启执行
+    if (_oomRestarting) return;
     try {
       const now = Date.now();
       // 事件循环延迟 = 实际间隔 - 定时周期，若主进程被同步 IO/execSync 卡住会显著增大
@@ -819,10 +824,19 @@ function startWatchdog() {
 
       // 内存保护：先回收空闲窗口，仍超危险阈值则保活重启
       if (m.rss > MEM_CRITICAL_BYTES) {
-        logError("watchdog-memory-critical", `rss=${Math.round(m.rss / 1048576)}MB 超过临界值(${Math.round(MEM_CRITICAL_BYTES / 1048576)}MB)，持久化任务后自动重启应用（保活）`);
+        _oomRestarting = true;
+        const memDesc = `rss=${Math.round(m.rss / 1048576)}MB`;
+        logError("watchdog-memory-critical", `${memDesc} 超过临界值(${Math.round(MEM_CRITICAL_BYTES / 1048576)}MB)，持久化任务后自动重启应用（保活）`);
         flushPendingTasks();
-        app.relaunch();
-        app.exit(1);
+        // 异常退出前发送飞书告警（未配置 webhook 时立即返回，最多等待 6 秒），
+        // 发送完成或失败后再执行重启，保证"退出前"通知尽量送达
+        Promise.resolve()
+          .then(() => require("./feishu").notifyOOMRestart(memDesc))
+          .catch((err) => logError("feishu-oom", err))
+          .finally(() => {
+            app.relaunch();
+            app.exit(1);
+          });
         return;
       }
       if (m.rss > MEM_WARN_BYTES) {
@@ -935,6 +949,16 @@ async function initTray() {
         },
       },
       { type: "separator" },
+      {
+        label: "飞书异常通知设置",
+        click: () => {
+          try {
+            require("./feishu").openConfigWindow();
+          } catch (err) {
+            helper.logError("tray-feishu", err);
+          }
+        },
+      },
       {
         label: "退出",
         click: () => {
