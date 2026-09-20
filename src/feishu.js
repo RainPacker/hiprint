@@ -391,4 +391,6 @@ module.exports = {
   clearRunningMarker,
   notifyOOMRestart,
   openConfigWindow,
+  // 供 print.js 孤儿窗口对账使用：返回配置窗口引用（可能为 null/已销毁）
+  getConfigWindow: () => _configWin,
 };

@@ -1,7 +1,8 @@
 "use strict";
 
-const { app, BrowserWindow, ipcMain, Tray, Menu } = require("electron");
+const { app, BrowserWindow, ipcMain, Tray, Menu, webContents } = require("electron");
 const path = require("path");
+const { exec } = require("child_process");
 const helper = require("./helper");
 const { logError, logInfo, flushLogs, truncateForLog, safeSendToMain, safeGetPrinters, isMainWindowAvailable, saveConfig, setProcessHighPriority } = helper;
 const address = require("address");
@@ -53,6 +54,10 @@ const EVENTLOOP_LAG_ALERT = 5000;
 const MEM_WARN_BYTES = 1100 * 1048576;
 // 内存危险阈值：超过则持久化任务后自动重启应用（保活，防 OOM 闪退）
 const MEM_CRITICAL_BYTES = 1600 * 1048576;
+// 孤儿资源回收观察阈值（毫秒）：窗口/渲染进程脱离业务引用持续超过此时长，
+// 判定为泄漏资源强制回收（孤儿窗口 destroy；宿主已毁的渲染进程 kill）。
+// 90s 足以避过正常切换窗口期（队列间 detach/attach 是同步完成，不会入观察名单）
+const ZOMBIE_RENDERER_KILL_MS = 90 * 1000;
 
 // 打印机队列映射表
 // key: 打印机名称, value: { queue, isPrinting, currentTask, window, timer, idleTimer, reuseCount, renderGone, pauseUntil }
@@ -107,6 +112,59 @@ function getTotalPendingCount() {
 }
 
 /**
+ * 从注册表读取 Windows 默认打印机（异步，带缓存）
+ *
+ * 背景：Electron 44（Chromium 新版）在 Windows 上 getPrintersAsync 返回的
+ * PrinterInfo.isDefault 恒为 undefined，导致空 printer 任务的默认打印机回退
+ * 失效，任务落入空名队列 → deviceName="" 打印挂起 → 30s 超时循环 → 崩溃
+ * （2026-09-20 生产日志复盘）。注册表是 Windows 默认打印机的权威存储：
+ *   HKCU\Software\Microsoft\Windows NT\CurrentVersion\Windows 的 Device 值
+ *   格式为 "打印机名,winspool,端口:"
+ *
+ * 必须用异步 exec：同步调用会冻结主进程（2026-09-15 schtasks 教训，
+ * WinServer 2019 上同步外部命令曾冻结主进程最长 20 秒）
+ *
+ * @param {string[]} printerNames - 当前可用打印机名列表（校验注册表值是否仍存在）
+ * @returns {Promise<string>} 默认打印机名，读不到或已不存在返回 ""
+ */
+let _defaultPrinterCache = { value: "", at: 0 };
+const DEFAULT_PRINTER_CACHE_MS = 60000;
+function getDefaultPrinterFromRegistry(printerNames) {
+  return new Promise((resolve) => {
+    // 缓存命中（含负结果缓存，避免反复查询）
+    if (_defaultPrinterCache.at && Date.now() - _defaultPrinterCache.at < DEFAULT_PRINTER_CACHE_MS) {
+      return resolve(_defaultPrinterCache.value);
+    }
+    exec(
+      'reg query "HKCU\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows" /v Device',
+      { timeout: 5000 },
+      (err, stdout) => {
+        let name = "";
+        if (!err && stdout) {
+          const m = stdout.match(/Device\s+REG_SZ\s+(.+)/);
+          if (m) {
+            name = m[1].trim().split(",")[0].trim();
+          }
+        }
+        // 注册表里的默认打印机可能已被删除（引用悬空），必须存在于当前列表才有效
+        if (name && printerNames.indexOf(name) !== -1) {
+          _defaultPrinterCache = { value: name, at: Date.now() };
+          logInfo("resolvePrinterName", `isDefault 缺失，注册表兜底默认打印机="${name}"`);
+          resolve(name);
+        } else {
+          if (name) {
+            logError("resolvePrinterName", `注册表默认打印机 "${name}" 不在打印机列表中，忽略`);
+            name = "";
+          }
+          _defaultPrinterCache = { value: "", at: Date.now() };
+          resolve("");
+        }
+      }
+    );
+  });
+}
+
+/**
  * 解析实际打印机名称
  * 如果指定的打印机不存在，回退到默认打印机
  * WinServer 启动时 Print Spooler 可能未就绪，返回空列表需安全处理
@@ -128,7 +186,14 @@ async function resolvePrinterName(requestedPrinter) {
       defaultPrinter = element.name;
     }
   });
-  return havePrinter ? requestedPrinter : defaultPrinter;
+  if (havePrinter) {
+    return requestedPrinter;
+  }
+  // Electron 44 Windows 下 isDefault 恒为 undefined，注册表兜底
+  if (!defaultPrinter) {
+    defaultPrinter = await getDefaultPrinterFromRegistry(printers.map((p) => p.name));
+  }
+  return defaultPrinter;
 }
 
 /**
@@ -142,6 +207,23 @@ async function enqueuePrintTask(data) {
 
   // 解析实际打印机名称
   const printerName = await resolvePrinterName(data.printer);
+
+  // 最后防线：绝不让任务落入空名队列。deviceName="" 的打印会挂起 →
+  // 30s 超时循环 → 窗口反复销毁重建 → 渲染进程泄漏 → 硬崩溃
+  // （2026-09-20 生产事故：26 次 printer="" 超时循环后主进程崩溃）
+  if (!printerName) {
+    logError("enqueuePrintTask-reject", `taskId=${data.taskId} 无法解析目标打印机（请求 printer="${data.printer}"，且无默认打印机可用），任务被拒绝`);
+    const socket = socketStore[data.socketId];
+    if (socket) {
+      try {
+        socket.emit("error", { msg: `无法确定目标打印机（printer="${data.printer}"，系统无可用默认打印机），任务被拒绝`, templateId: data.templateId });
+      } catch (e) { /* socket 可能已断开 */ }
+    }
+    // news-server 任务在渲染前已持久化，这里统一移除，防止崩溃重启后反复恢复
+    store.removeTask(data.taskId);
+    return;
+  }
+
   data.printer = printerName;
   data._resolvedPrinter = printerName;
 
@@ -323,6 +405,21 @@ function createPrinterWindow() {
 
   const win = new BrowserWindow(windowOptions);
 
+  // 窗口关闭：只清空"当前持有该窗口"的队列引用。
+  // 注意：窗口可能被多个队列先后持有（findAndDetachIdleWindow 空闲剥离复用），
+  // 必须实时查找持有者。旧实现每次 attach 注册一个闭包监听并无条件置空，
+  // 窗口销毁时会把其他队列正在持有的新窗口引用一并抹掉 → 孤儿窗口永不销毁
+  // → 渲染进程泄漏（2026-09-20 生产复盘：账面打印窗口=1，实际 27 个 Tab 进程）
+  win.on("closed", () => {
+    for (const [name, pq] of printerQueues) {
+      if (pq.window === win) {
+        logInfo("printWindow-closed", `printer="${name}" 窗口已关闭`);
+        pq.window = null;
+        break;
+      }
+    }
+  });
+
   // 渲染进程崩溃自动恢复
   win.webContents.on("render-process-gone", (event, details) => {
     logError("printWindow-render-gone", `reason=${details.reason} exitCode=${details.exitCode}`);
@@ -445,11 +542,7 @@ function ensurePrinterWindow(printerName) {
     pq.renderGone = false;
   }
 
-  win.on("closed", () => {
-    logInfo("ensurePrinterWindow-closed", `printer="${printerName}" 窗口已关闭`);
-    pq.window = null;
-  });
-
+  // closed 监听已在 createPrinterWindow 内注册（按当前持有者清理，防止误清他队列引用）
   pq.window = win;
   return { window: win, isNew: isNew };
 }
@@ -768,6 +861,119 @@ function flushPendingTasks() {
   }
 }
 
+// ========== 孤儿资源对账（watchdog 兜底防线） ==========
+// 泄漏机制（2026-09-20 生产复盘，账面打印窗口=1 实际 27 个 Tab 进程）：
+// 旧 closed 监听 bug 把其他队列正在持有的活窗口引用误清 → 窗口无人管理
+// 永不 destroy → 渲染进程跟着活到应用结束（每个 100~150MB）。
+// 源头已修（closed 按持有者清理），此处对账兜底防其他未知路径产生孤儿：
+//   白名单 = printerQueues 持有窗口 + 主窗口 + 飞书配置窗口
+//   树上挂着但不在白名单的窗口 = 孤儿 → 观察超时后 destroy；
+//   宿主已销毁但渲染进程仍残留 → 观察超时后 process.kill
+let _orphanSuspects = new Map(); // pid -> { first, win }（win=null 表示纯进程残留）
+function sweepOrphanResources() {
+  try {
+    const now = Date.now();
+    // 白名单：所有仍被业务持有的渲染进程
+    const legitWins = new Set(); // BrowserWindow 白名单
+    const legitViewPids = new Set(); // 主窗口 WebContentsView 子视图（loading overlay 等过渡视图）
+    printerQueues.forEach((pq) => {
+      if (pq.window && !pq.window.isDestroyed()) legitWins.add(pq.window);
+    });
+    try {
+      if (global.MAIN_WINDOW && !global.MAIN_WINDOW.isDestroyed()) {
+        legitWins.add(global.MAIN_WINDOW);
+        // WebContentsView 不属于 BrowserWindow（fromWebContents 返回 null），
+        // 必须从 contentView 子视图收集；loading overlay 移除后即脱离白名单，会被正确回收
+        const children = global.MAIN_WINDOW.contentView.children || [];
+        children.forEach((v) => {
+          try {
+            if (v.webContents && !v.webContents.isDestroyed()) {
+              const p = v.webContents.getOSProcessId();
+              if (p) legitViewPids.add(p);
+            }
+          } catch (e) { /* 单个 view 异常 */ }
+        });
+      }
+    } catch (e) { /* global 未初始化 */ }
+    try {
+      const cfgWin = require("./feishu").getConfigWindow();
+      if (cfgWin && !cfgWin.isDestroyed()) legitWins.add(cfgWin);
+    } catch (e) { /* feishu 模块不可用 */ }
+
+    // 视野一：活 webContents（处理孤儿窗口——树上挂着但无业务引用）
+    const seenPids = new Set();
+    webContents.getAllWebContents().forEach((wc) => {
+      try {
+        if (wc.isDestroyed()) return;
+        const pid = wc.getOSProcessId();
+        if (!pid) return;
+        seenPids.add(pid);
+
+        const host = BrowserWindow.fromWebContents(wc);
+        const hostAlive = host && !host.isDestroyed();
+        if ((hostAlive && legitWins.has(host)) || legitViewPids.has(pid)) {
+          _orphanSuspects.delete(pid); // 合法渲染进程，解除观察
+          return;
+        }
+
+        // 孤儿窗口：有宿主但不在白名单
+        const prev = _orphanSuspects.get(pid);
+        if (!prev) {
+          _orphanSuspects.set(pid, { first: now, win: hostAlive ? host : null });
+          logInfo("watchdog-orphan-suspect", `渲染进程 PID=${pid} ${hostAlive ? "窗口不被任何队列持有（孤儿窗口）" : "宿主窗口已销毁（渲染进程残留）"}，开始观察（${ZOMBIE_RENDERER_KILL_MS / 1000}s 后回收）`);
+          return;
+        }
+        if (now - prev.first < ZOMBIE_RENDERER_KILL_MS) return;
+
+        if (hostAlive && prev.win === host) {
+          logError("watchdog-orphan-window", `孤儿窗口 PID=${pid} 持续 ${Math.round((now - prev.first) / 1000)}s 无人认领，销毁回收`);
+          try { host.destroy(); } catch (e) { /* 已销毁 */ }
+        } else {
+          logError("watchdog-zombie-renderer", `渲染进程 PID=${pid} 脱离宿主 ${Math.round((now - prev.first) / 1000)}s 未退出，强制回收`);
+          try {
+            process.kill(pid); // Windows 下等价 TerminateProcess，自身子进程必有权限
+          } catch (e) {
+            if (e.code !== "ESRCH") logError("watchdog-zombie-kill", `PID=${pid} ${e.message}`);
+          }
+        }
+        _orphanSuspects.delete(pid);
+      } catch (e) { /* 单个 wc 异常不影响对账 */ }
+    });
+
+    // 视野二：app metrics（destroy 后渲染进程的 wc 已从视野一消失，但进程可能残留——
+    // 实测 2026-09-20：print() 挂起场景 destroy 后 Tab 进程存活 2.5 分钟+）
+    const metricsList = app.getAppMetrics();
+    metricsList.forEach((m) => {
+      try {
+        if (m.type !== "Tab" || seenPids.has(m.pid)) return; // 只处理无活 wc 的 Tab 进程
+        const prev = _orphanSuspects.get(m.pid);
+        if (!prev) {
+          _orphanSuspects.set(m.pid, { first: now, win: null });
+          logInfo("watchdog-orphan-suspect", `渲染进程 PID=${m.pid} 宿主已销毁（destroy 后残留），开始观察（${ZOMBIE_RENDERER_KILL_MS / 1000}s 后强制回收）`);
+          return;
+        }
+        if (now - prev.first < ZOMBIE_RENDERER_KILL_MS) return;
+        // 此处必然无活 wc（有的话被视野一处理），无论历史记录来源，超时即回收
+        logError("watchdog-zombie-renderer", `渲染进程 PID=${m.pid} destroy 后 ${Math.round((now - prev.first) / 1000)}s 未退出，强制回收`);
+        try {
+          process.kill(m.pid);
+        } catch (e) {
+          if (e.code !== "ESRCH") logError("watchdog-zombie-kill", `PID=${m.pid} ${e.message}`);
+        }
+        _orphanSuspects.delete(m.pid);
+      } catch (e) { /* 单条 metrics 异常不影响对账 */ }
+    });
+
+    // 清理本轮已消失的观察项（进程自行退出了）
+    const metricPids = new Set(metricsList.map((m) => m.pid));
+    for (const pid of _orphanSuspects.keys()) {
+      if (!seenPids.has(pid) && !metricPids.has(pid)) _orphanSuspects.delete(pid);
+    }
+  } catch (err) {
+    logError("watchdog-orphan-sweep", err);
+  }
+}
+
 // ========== 看门狗（保活 + 运行时诊断日志） ==========
 
 /**
@@ -820,6 +1026,8 @@ function startWatchdog() {
         } catch (e) {
           logError("watchdog-metrics", e);
         }
+        // 孤儿资源对账（孤儿窗口/destroy 后残留渲染进程，观察超时后回收）
+        sweepOrphanResources();
       }
 
       // 内存保护：先回收空闲窗口，仍超危险阈值则保活重启
