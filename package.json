@@ -1,7 +1,7 @@
 {
   "name": "electron-hiprint",
   "version": "2.0.3",
-  "description": "vue-plugin-hiprint client",
+  "description": "vue-plugin-hiprint client for electron",
   "main": "main.js",
   "author": "254856090@qq.com",
   "license": "MIT",
